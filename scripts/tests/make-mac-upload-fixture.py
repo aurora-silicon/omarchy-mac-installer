@@ -3,7 +3,8 @@
 
 The directory looks like the image build's artifact (`mac-image.yml`): one
 image zip, its `.sha256` line and the image records. The zip is filler bytes,
-not an image; the upload job never opens it. With --evidence, a passing
+not an image; the upload job never opens it. installer_data.json carries the
+board restrictions of the image's hardware profile and IMAGE names it. With --evidence, a passing
 acceptance evidence record for it is written too.
 
 Usage:
@@ -28,7 +29,21 @@ def filler(seed: str, size: int) -> bytes:
     return (block * (size // len(block) + 1))[:size]
 
 
-def make(out: Path, size: int, seed: str) -> tuple[str, str]:
+def installer_data(hardware_profile: str = "legacy") -> dict:
+    """The board restrictions of the image builder's installer_data.json."""
+    neo = hardware_profile == "neo"
+    return {"os_list": [{"omarchy_target": "apple-silicon-full-os", "name": "Omarchy MX Mac",
+                         "allowed_device_classes": ["j700ap"] if neo else None,
+                         "excluded_device_classes": [] if neo else ["j700ap"]}]}
+
+
+def hardware_evidence(name: str, sha256: str, **changes) -> dict:
+    """A passing hardware install record for a Neo image."""
+    return {"kind": "hardware-install", "image": name, "image_sha256": sha256, "board": "apple,j700",
+            "installer_version": "2.3.0", "tester": "fixture tester", "result": "pass", **changes}
+
+
+def make(out: Path, size: int, seed: str, hardware_profile: str = "legacy") -> tuple[str, str]:
     out.mkdir(parents=True, exist_ok=True)
     zip_name = f"omarchy-{DATE}-aarch64-apple-silicon-mac-edge-os-package.zip"
     payload = filler(seed, size)
@@ -38,6 +53,9 @@ def make(out: Path, size: int, seed: str) -> tuple[str, str]:
     name = f"omarchy-mac-edge-{DATE}-{hashlib.sha256(seed.encode()).hexdigest()[:12]}"
     for record in RECORDS:
         (out / record).write_text(f"fixture {record} for {name}\n")
+    (out / "installer_data.json").write_text(json.dumps(installer_data(hardware_profile)) + "\n")
+    with (out / "IMAGE").open("a") as image:
+        image.write(f"hardware_profile={hardware_profile}\n")
     return name, sha256
 
 

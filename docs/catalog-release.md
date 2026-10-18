@@ -1,6 +1,6 @@
 # Mac catalog release
 
-`.github/workflows/mac-catalog.yml` signs and publishes a channel catalog that pins one uploaded image, its engine and its `installer_data.json` by digest. It is a reusable workflow (`workflow_call`) for the edge publish trigger and can be run by hand (`workflow_dispatch`). It writes only `edge`; rc and stable catalogs come from `.github/workflows/mac-promote.yml` (see [Promotion](#promotion-parked), parked). Both sign through `.github/workflows/mac-catalog-sign.yml`, the only workflow that reads the catalog key.
+`.github/workflows/mac-catalog.yml` signs and publishes a channel catalog that pins one uploaded image, its engine and its `installer_data.json` by digest, and on edge optionally the MacBook Neo's own image beside it. It is a reusable workflow (`workflow_call`) for the edge publish trigger and can be run by hand (`workflow_dispatch`). It writes only `edge`; rc and stable catalogs come from `.github/workflows/mac-promote.yml` (see [Promotion](#promotion-parked), parked). Both sign through `.github/workflows/mac-catalog-sign.yml`, the only workflow that reads the catalog key.
 
 ## The Omacom catalog key
 
@@ -14,13 +14,13 @@
 
 | Job | Holds | Does |
 | --- | --- | --- |
-| `prepare` | no secrets, `contents: read` | runs the catalog tests, refuses unless the evidence record passed for the image's exact sha256, downloads every pinned artifact (or part) and checks its size and sha256, checks the new sequence follows the published one, writes the unsigned `catalog-<channel>.json` |
-| `sign` (`mac-catalog-sign.yml`) | `catalog-release` (owner approval), `contents: read` | checks the catalog is the one `prepare` wrote and re-checks the evidence, signs with OpenSSL 3, wraps the envelope with `publish-channels envelope` and verifies it against `Release/trust-root.ed25519.pub`. A dry run publishes to a scratch directory on the runner and keeps only the log |
+| `prepare` | no secrets, `contents: read` | runs the catalog tests, refuses unless the evidence record passed for the image's exact sha256, downloads every pinned artifact (or part) and checks its size and sha256, checks each image's `installer_data.json` admits exactly the Macs the catalog gives that image, checks the new sequence follows the published one, writes the unsigned `catalog-<channel>.json` and, under `installer-data/<sha256>.json`, the `installer_data.json` files it downloaded. A Neo image that fails any check is left out with a warning (`neo=dropped: ...`); the M1, M2 and M3 image still fails closed |
+| `sign` (`mac-catalog-sign.yml`) | `catalog-release` (owner approval), `contents: read` | checks the catalog is the one `prepare` wrote and re-checks each payload: the VM evidence for the M1, M2 and M3 image, the hardware install record for the Neo image, and that each image's `installer_data.json` admits exactly its Macs, signs with OpenSSL 3, wraps the envelope with `publish-channels envelope` and verifies it against `Release/trust-root.ed25519.pub`. A dry run publishes to a scratch directory on the runner and keeps only the log |
 | `publish` (`mac-catalog-sign.yml`) | `contents: write`, no key; skipped in a dry run | verifies the envelope again, refuses a sequence that does not follow the published one, replaces the catalog on the host and reads it back |
 
 `scripts/catalog_release.py` implements every step; `scripts/tests/test_catalog_release.py` drives it as the workflows do (round trip, evidence refusals, signing refusals, hosts, dry run, promotion). `Tests/OmarchyAppleInstallerTrustCoreTests/CISignedCatalogTests.swift` checks the app accepts an envelope the CI path signed.
 
-`mac-catalog-sign.yml` is `workflow_call` only. Its caller uploads the artifact `catalog-unsigned` (the file `channel`, `catalog-<channel>.json` and the gate's inputs) and names the gate: `evidence` re-runs `check-evidence` on `evidence.json`; `promotion` re-runs `check-promotion` on `source-channel` and `source.signed.json`.
+`mac-catalog-sign.yml` is `workflow_call` only. Its caller uploads the artifact `catalog-unsigned` (the file `channel`, `catalog-<channel>.json` and the gate's inputs) and names the gate: `evidence` re-runs `check-evidence` on `evidence.json`, `neo-evidence.json` (when the catalog carries the Neo image) and `installer-data/`; `promotion` re-runs `check-promotion` on `source-channel` and `source.signed.json`.
 
 ## Callers
 
@@ -36,7 +36,12 @@ All JSON inputs are strict: unknown keys are refused. Digests are 64 lowercase h
 - `engine`: `{"version", "url", "fileName", "sizeBytes", "sha256", "downstreamRevision"}`, optionally `asahiInstallerTag`, `asahiInstallerRevision` and `asahiInstallerDataRevision`, which default to `Engine/source-lock.json`.
 - `installer`: `{"minimumVersion", "latestVersion", "downloadURL"}`, the app compatibility block. Required for engines from `v0.9.2-omarchy.18` (every current engine), whose `minimumVersion` must be 2.1.0 or later; `downloadURL` is under `.../v1/installer/` or a non-catalog release of this repository.
 - `evidence`: the VM evidence record below.
+- `neo-image`, `neo-payload`, `neo-installer-data`, `neo-evidence` (edge only, optional, all empty by default): the MacBook Neo's image in the forms above, and its [hardware install record](#hardware-install-record). With them the catalog pins the Neo (`apple,j700`) to its own payload and `installer_data.json`, and every other Mac to the M1, M2 and M3 image; the two images must differ in name and digests, and `installer.minimumVersion` must be 2.3.0 or later.
 - `dry-run`: defaults to true.
+
+## Boards and payloads
+
+`scripts/supported-models.json` lists every supported Mac; `hardware_profiles` names those that boot an image of their own (the Neo: `neo`), and every other one takes the legacy image. A catalog that offers any Mac enables every M1, M2 and M3 Mac on one legacy payload. It may leave the Neo out, and when it lists the Neo, the Neo's payload is its own: no payload is shared between hardware profiles (`supported_models.py check-catalog` and `publish-channels envelope` refuse it). `prepare` and `check-evidence` also read each image's `installer_data.json`: its one Omarchy target admits the Macs whose device class (`apple,j314s` is `j314sap`) is in `allowed_device_classes` (when set) and not in `excluded_device_classes`, and those must be exactly the Macs the catalog gives that payload, so a catalog cannot send a Mac an image that refuses it, or leave out one the image admits.
 
 ## VM evidence record
 
@@ -61,6 +66,29 @@ The VM acceptance job (`mac-acceptance.yml`) writes and attests it; the upload (
 - A publish is refused unless `image_sha256` equals the payload's `sha256`, `result` is `pass`, no scenario failed, and `first-boot`, `conversion` and `second-boot` (the harness's `fresh-install`) all passed.
 - Other keys may be added and are ignored here.
 - The record is trusted as passed in: the workflow checks its shape and digest, not its origin. When chained (ticket 09), it must come from the acceptance job of the same run; run by hand, the owner's approval of the `sign` job is the check that it is genuine. Binding it to a verified acceptance run (fetching `run_url`'s artifact) is left to tickets 06 and 09.
+
+## Hardware install record
+
+The gate for an image the VM harness cannot boot: today only the MacBook Neo's (see [mac-release-pipeline.md](mac-release-pipeline.md#the-macbook-neo-image) for why). A tester installs the image's exact zip on a real Neo and records it; the release pipeline's dispatcher passes it as the `neo-hardware-evidence` input, and `mac-upload.yml` publishes it beside the image as `hardware-evidence.json`.
+
+```json
+{
+  "kind": "hardware-install",
+  "image": "omarchy-mac-edge-<YYYY.MM.DD>-<12 hex package set id>",
+  "image_sha256": "<sha256 of the image zip, 64 lowercase hex>",
+  "board": "apple,j700",
+  "installer_version": "2.3.0",
+  "tester": "<who installed it>",
+  "result": "pass",
+  "recorded_at": "<optional>",
+  "notes": "<optional>"
+}
+```
+
+- Unknown keys are refused. `scripts/hardware_evidence.py` checks the form; `hardware_evidence.py describe FILE` checks a record before you dispatch.
+- Accepted on edge only: `check-evidence` refuses rc and stable, and promotion refuses a catalog with two images, so rc and stable stay single-image.
+- `image` and `image_sha256` must be the Neo image's name and payload digest; `board` must be a Mac with its own hardware profile (never an M1, M2 or M3, whose images pass VM acceptance); the image's IMAGE must record that board's profile and its `installer_data.json` admit that board alone; `installer_version` must be at least the catalog's `installer.minimumVersion`; `result` must be `pass`.
+- Nothing attests the record: the dispatcher supplies it and the owner reviews it in the `catalog-release` approval of the run that signs it.
 
 ## Hosts
 

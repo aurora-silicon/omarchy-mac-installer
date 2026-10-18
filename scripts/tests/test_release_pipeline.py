@@ -131,27 +131,71 @@ class Ordering(unittest.TestCase):
         self.jobs = jobs(PIPELINE)
 
     def test_the_chain_is_build_acceptance_inputs_upload_catalog(self):
-        self.assertEqual(list(self.jobs), ["plan", "build", "acceptance", "catalog-inputs", "upload", "catalog"])
+        self.assertEqual(list(self.jobs), ["plan", "build", "acceptance", "catalog-inputs", "upload", "neo-recovery",
+                                           "neo-build", "neo-evidence", "neo-upload", "neo", "catalog"])
         self.assertEqual(field(self.jobs["build"], "needs"), "plan")
         self.assertEqual(field(self.jobs["acceptance"], "needs"), "build")
         self.assertEqual(field(self.jobs["upload"], "needs"), "[build, acceptance, catalog-inputs]")
         self.assertEqual(field(self.jobs["catalog-inputs"], "needs"), "acceptance")
-        self.assertEqual(field(self.jobs["catalog"], "needs"), "[build, acceptance, upload, catalog-inputs]")
+        self.assertEqual(field(self.jobs["catalog"], "needs"), "[build, acceptance, upload, catalog-inputs, neo]")
         for job, workflow in (("build", "mac-image"), ("acceptance", "mac-acceptance"), ("upload", "mac-upload"),
-                              ("catalog", "mac-catalog")):
+                              ("catalog", "mac-catalog"), ("neo-build", "mac-image"), ("neo-upload", "mac-upload")):
             self.assertEqual(field(self.jobs[job], "uses"), f"./.github/workflows/{workflow}.yml")
 
     def test_upload_and_catalog_never_run_without_passing_evidence(self):
         passed = "needs.acceptance.outputs.result == 'pass'"
         for job in ("upload", "catalog-inputs"):
             self.assertEqual(field(self.jobs[job], "if"), passed)
-        self.assertEqual(field(self.jobs["catalog"], "if"), f"{passed} && !inputs.dry-run")
-        for job in ("upload", "catalog-inputs", "catalog"):
-            condition = field(self.jobs[job], "if")
+        for job in ("upload", "catalog-inputs", "neo-upload"):
             # A status function would let a job run after a failed need.
-            self.assertNotRegex(condition, r"always\(\)|failure\(\)|cancelled\(\)|success\(\)")
+            self.assertNotRegex(field(self.jobs[job], "if"), r"always\(\)|failure\(\)|cancelled\(\)|success\(\)")
+        # The catalog runs past a failed Neo step, so it names every M1, M2
+        # and M3 one that must have passed.
+        condition = " ".join(re.search(r"(?m)^    if: >-\n((?:      .*\n)+)", self.jobs["catalog"] + "\n").group(1).split())
+        self.assertTrue(condition.startswith("!cancelled() && "), condition)
+        self.assertNotRegex(condition, r"always\(\)|failure\(\)|\bsuccess\(\)")
+        for need in ("build", "acceptance", "catalog-inputs", "upload", "neo"):
+            self.assertIn(f"needs.{need}.result == 'success'", condition)
+        self.assertIn(passed, condition)
+        self.assertTrue(condition.endswith("&& !inputs.dry-run"), condition)
         # Nothing becomes public before the catalog's inputs are known good.
         self.assertIn("catalog-inputs", field(self.jobs["upload"], "needs"))
+
+    def test_the_neo_image_never_holds_back_the_m1_m2_m3_image(self):
+        legacy = ("plan", "build", "acceptance", "catalog-inputs", "upload")
+        for job in legacy:
+            with self.subTest(job):
+                self.assertNotIn("neo", field(self.jobs[job], "needs"))
+        self.assertEqual(field(self.jobs["neo-recovery"], "needs"), "plan")
+        self.assertEqual(field(self.jobs["neo-build"], "needs"), "neo-recovery")
+        self.assertEqual(field(self.jobs["neo-evidence"], "needs"), "plan")
+        self.assertEqual(field(self.jobs["neo-upload"], "needs"), "[neo-evidence, upload]")
+        self.assertEqual(field(self.jobs["neo"], "needs"), "[neo-build, neo-evidence, neo-upload]")
+        self.assertEqual(field(self.jobs["neo"], "if"), "${{ !cancelled() }}")
+        self.assertEqual(field(self.jobs["neo-evidence"], "if"), "inputs.neo-hardware-evidence != ''")
+
+    def test_the_neo_image_is_built_by_mac_image_and_gated_by_its_hardware_record(self):
+        build, upload_job = self.jobs["neo-build"], self.jobs["neo-upload"]
+        for line in ("hardware-profile: neo", "recovery-app-artifact: neo-native-recovery-input"):
+            self.assertIn(line, build)
+        self.assertIn("name: neo-native-recovery-input", self.jobs["neo-recovery"])
+        self.assertIn("bash Recovery/build-recovery.sh", self.jobs["neo-recovery"])
+        # No VM acceptance for the Neo image, and no VM evidence for its upload.
+        self.assertNotIn("mac-acceptance.yml", build + upload_job + self.jobs["neo"])
+        self.assertNotIn("evidence-artifact", upload_job)
+        for line in ("image-artifact: ${{ needs.neo-evidence.outputs.image }}",
+                     "image-sha256: ${{ needs.neo-evidence.outputs.sha256 }}",
+                     "image-run-id: ${{ inputs.neo-image-run-id }}",
+                     "hardware-evidence: ${{ needs.neo-evidence.outputs.evidence }}",
+                     "dry-run: ${{ inputs.dry-run }}", "make-public: ${{ !inputs.dry-run }}"):
+            self.assertIn(line, upload_job)
+        for line in ("neo-image: ${{ needs.neo.outputs.image }}", "neo-payload: ${{ needs.neo.outputs.payload }}",
+                     "neo-installer-data: ${{ needs.neo.outputs.installer-data }}",
+                     "neo-evidence: ${{ needs.neo.outputs.evidence }}"):
+            self.assertIn(line, self.jobs["catalog"])
+        image = text(WORKFLOWS / "mac-image.yml")
+        self.assertIn("group: mac-image-edge-${{ inputs.hardware-profile || 'legacy' }}", image)
+        self.assertIn('grep -qx "hardware_profile=$HARDWARE_PROFILE" "$WORK/out/IMAGE"', image)
 
     def test_the_acceptance_result_is_its_gate_not_a_default(self):
         acceptance = jobs(ACCEPTANCE)["acceptance"]
@@ -219,6 +263,11 @@ class Secrets(unittest.TestCase):
         for workflow in ("mac-image.yml", "mac-acceptance.yml"):
             with self.subTest(workflow):
                 self.assertNotIn("secrets.", text(WORKFLOWS / workflow))
+
+    def test_the_sign_job_checks_each_payload_against_its_own_evidence(self):
+        gate = text(WORKFLOWS / "mac-catalog-sign.yml").split("evidence:edge)")[1].split(";;")[0]
+        self.assertIn('--installer-data-dir "$inputs/installer-data"', gate)
+        self.assertIn('neo=(--neo-evidence "$inputs/neo-evidence.json")', gate)
 
     def test_a_real_upload_runs_in_the_publish_environment(self):
         self.assertEqual(field(jobs(WORKFLOWS / "mac-upload.yml")["upload"], "environment"),
@@ -676,10 +725,20 @@ class Config(unittest.TestCase):
         self.assertEqual(engine["downstreamRevision"], template["downstream_revision"])
         catalog.check_engine(engine)
 
-    def test_the_app_block_is_unset_or_one_the_catalog_takes(self):
+    def test_the_app_block_is_unset_pending_or_one_the_catalog_takes(self):
         self.assertEqual(set(self.config), {"engine", "installer"})
-        if self.config["installer"] is not None:
-            catalog.check_installer(self.config["installer"], self.config["engine"]["version"])
+        installer = self.config["installer"]
+        if installer is not None and installer["downloadURL"] is None:
+            # Filled in once mac-app-release.yml has published that version.
+            self.assertEqual(set(installer), {"minimumVersion", "latestVersion", "downloadURL"})
+        elif installer is not None:
+            catalog.check_installer(installer, self.config["engine"]["version"])
+
+    def test_the_edge_catalog_requires_app_2_3_0(self):
+        self.assertEqual(self.config["installer"]["minimumVersion"], "2.3.0")
+        self.assertEqual(self.config["installer"]["latestVersion"], "2.3.0")
+        self.assertIn('marketing_version="${OMARCHY_APP_VERSION:-2.3.0}"',
+                      (ROOT / "Packaging" / "build-app.sh").read_text())
 
 
 
@@ -708,6 +767,13 @@ class CatalogInputs(unittest.TestCase):
         return {"minimumVersion": "2.1.0", "latestVersion": "2.2.0",
                 "downloadURL": f"https://github.com/{catalog.stopgap_repo()}/releases/download/v2.2.0/app.dmg"}
 
+    def test_a_real_run_for_an_unreleased_app_stops_before_the_upload(self):
+        pending = {"minimumVersion": "2.3.0", "latestVersion": "2.3.0", "downloadURL": None}
+        status, output = self.run_step(pending, "false")
+        self.assertNotEqual(status, 0)
+        self.assertIn("requires app 2.3.0, which is not released yet", output)
+        self.assertEqual(self.run_step(pending, "true")[0], 0)
+
     def test_a_real_run_without_an_app_release_stops_before_the_upload(self):
         status, output = self.run_step(None, "false")
         self.assertNotEqual(status, 0)
@@ -729,6 +795,135 @@ class CatalogInputs(unittest.TestCase):
         lines = dict(line.split("=", 1) for line in output.splitlines() if "=" in line and not line.startswith("::"))
         self.assertEqual(json.loads(lines["engine"]), self.engine)
         self.assertEqual(json.loads(lines["installer"]), self.installer())
+
+class NeoSteps(unittest.TestCase):
+    """The pipeline's Neo steps: the record check, and the step that hands the
+    catalog the Neo image or says why it offers the M1, M2 and M3 one alone."""
+
+    NEO = "omarchy-mac-edge-2026.10.14-fedcba987654"
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="omarchy-release-pipeline-neo-"))
+        self.addCleanup(shutil.rmtree, self.directory)
+
+    def run_step(self, path: Path, step: str, **env: str) -> tuple[int, str, str]:
+        output, summary = self.directory / "output", self.directory / "summary"
+        output.write_text("")
+        summary.write_text("")
+        result = subprocess.run(["bash", "--noprofile", "--norc", "-c", step_script(path, step)], cwd=ROOT,
+                                env={"PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(output),
+                                     "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_RUN_ID": "42",
+                                     "RUNNER_TEMP": str(self.directory), **env},
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.output = result.stdout + result.stderr
+        return result.returncode, output.read_text(), summary.read_text() + result.stdout
+
+    def record(self, **changes) -> str:
+        return json.dumps(fixture.hardware_evidence(self.NEO, SHA, **changes))
+
+    def check(self, evidence: str, run_id: str = "38555025363") -> tuple[int, str, str]:
+        return self.run_step(PIPELINE, "Check the hardware install record", EVIDENCE=evidence, IMAGE_RUN_ID=run_id)
+
+    def test_a_good_record_names_the_image_to_upload(self):
+        status, output, _ = self.check(self.record())
+        self.assertEqual(status, 0, self.output)
+        lines = dict(line.split("=", 1) for line in output.splitlines())
+        self.assertEqual((lines["image"], lines["sha256"]), (self.NEO, SHA))
+        self.assertEqual(json.loads(lines["evidence"]), fixture.hardware_evidence(self.NEO, SHA))
+
+    def test_a_bad_record_or_run_stops_only_the_neo(self):
+        for evidence, run_id in ((self.record(), ""), (self.record(), "abc"), (self.record(result="fail"), "1"),
+                                 (self.record(board="apple,j314s"), "1"), ("not json", "1"),
+                                 (json.dumps(fixture.hardware_evidence(self.NEO.replace("edge", "rc"), SHA)), "1")):
+            with self.subTest(evidence=evidence, run_id=run_id):
+                status, output, _ = self.check(evidence, run_id)
+                self.assertNotEqual(status, 0)
+                self.assertEqual(output, "")
+
+    def pick(self, **env: str) -> tuple[int, str, str]:
+        defaults = {"BUILD": "success", "BUILT": "omarchy-mac-edge-2026.10.19-aaaaaaaaaaaa", "BUILT_SHA256": SHA,
+                    "EVIDENCE_GIVEN": "true", "EVIDENCE": "success", "UPLOAD": "success", "IMAGE": self.NEO,
+                    "PAYLOAD": '{"url":"x"}', "INSTALLER_DATA": '{"url":"y"}', "RECORD": '{"result":"pass"}',
+                    "DRY_RUN": "false"}
+        return self.run_step(PIPELINE, "Offer the Neo image or say why not", **{**defaults, **env})
+
+    def test_a_passing_neo_goes_to_the_catalog(self):
+        status, output, summary = self.pick()
+        self.assertEqual(status, 0, self.output)
+        self.assertEqual(output, f'image={self.NEO}\npayload={{"url":"x"}}\ninstaller-data={{"url":"y"}}\n'
+                                 'evidence={"result":"pass"}\n')
+        self.assertIn("the catalog offers it", summary)
+        self.assertIn("neo-image-run-id=42", summary)
+
+    def test_any_neo_failure_leaves_the_m1_m2_m3_catalog_with_a_warning(self):
+        for change in ({"UPLOAD": "failure"}, {"EVIDENCE": "failure", "UPLOAD": "skipped"},
+                       {"UPLOAD": "success", "PAYLOAD": ""}, {"BUILD": "failure", "UPLOAD": "cancelled"}):
+            with self.subTest(change):
+                status, output, summary = self.pick(**change)
+                self.assertEqual(status, 0, self.output)
+                self.assertEqual(output, "")
+                self.assertIn("::warning::the Neo image is left out", summary)
+                self.assertIn("offers the M1, M2 and M3 image alone", summary)
+
+    def test_no_record_is_the_m1_m2_m3_catalog_and_a_failed_build_warns(self):
+        status, output, summary = self.pick(EVIDENCE_GIVEN="false", EVIDENCE="skipped", UPLOAD="skipped",
+                                            PAYLOAD="", BUILD="failure")
+        self.assertEqual((status, output), (0, ""), self.output)
+        self.assertIn("No Neo hardware evidence was supplied", summary)
+        self.assertIn("::warning::the Neo image did not build in this run (failure)", summary)
+
+    def test_a_dry_run_hands_the_catalog_nothing(self):
+        status, output, summary = self.pick(DRY_RUN="true", PAYLOAD="")
+        self.assertEqual((status, output), (0, ""), self.output)
+        self.assertIn("the catalog offers it", summary)
+
+
+def modern_bash() -> str | None:
+    """A Bash that expands an empty array under set -u, as the runners' does."""
+    for candidate in (shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash"):
+        if candidate and os.access(candidate, os.X_OK) and subprocess.run(
+                [candidate, "-c", "set -u; a=(); : \"${a[@]}\""], capture_output=True).returncode == 0:
+            return candidate
+    return None
+
+
+@unittest.skipIf(modern_bash() is None, "Bash 4.4 or newer is required")
+class UploadInputs(unittest.TestCase):
+    def check(self, dry_run: str, artifact: str = "", hardware: str = "") -> int:
+        directory = Path(tempfile.mkdtemp(prefix="omarchy-upload-inputs-"))
+        self.addCleanup(shutil.rmtree, directory)
+        env = {"PATH": os.environ["PATH"], "IMAGE": "omarchy-mac-edge-2026.10.14-0123456789ab", "IMAGE_SHA256": SHA,
+               "IMAGE_RUN_ID": "", "EVIDENCE_RUN_ID": "", "PART_BYTES": "", "DRY_RUN": dry_run,
+               "EVIDENCE_ARTIFACT": artifact, "HARDWARE_EVIDENCE": hardware, "GITHUB_REF": "refs/heads/main",
+               "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_OUTPUT": str(directory / "out"),
+               "GITHUB_ENV": str(directory / "env"), "RUNNER_TEMP": str(directory)}
+        return subprocess.run([modern_bash(), "--noprofile", "--norc", "-c",
+                               step_script(WORKFLOWS / "mac-upload.yml", "Check the inputs")],
+                              cwd=ROOT, env=env, stdin=subprocess.DEVNULL, capture_output=True).returncode
+
+    def test_a_real_upload_takes_vm_evidence_or_a_hardware_record_never_both(self):
+        self.assertEqual(self.check("false", artifact="acceptance-evidence"), 0)
+        self.assertEqual(self.check("false", hardware='{"kind": "hardware-install"}'), 0)
+        self.assertNotEqual(self.check("false"), 0)
+        self.assertNotEqual(self.check("false", artifact="acceptance-evidence", hardware="{}"), 0)
+        self.assertEqual(self.check("true"), 0)
+
+
+class ImageProfile(unittest.TestCase):
+    def check(self, profile: str, artifact: str) -> int:
+        return subprocess.run(["bash", "--noprofile", "--norc", "-c",
+                               step_script(WORKFLOWS / "mac-image.yml", "Check the hardware profile")],
+                              env={"PATH": os.environ["PATH"], "HARDWARE_PROFILE": profile, "RECOVERY_ARTIFACT": artifact},
+                              stdin=subprocess.DEVNULL, capture_output=True).returncode
+
+    def test_legacy_takes_no_recovery_input_and_neo_needs_one(self):
+        self.assertEqual(self.check("legacy", ""), 0)
+        self.assertEqual(self.check("neo", "neo-native-recovery-input"), 0)
+        for profile, artifact in (("neo", ""), ("legacy", "neo-native-recovery-input"), ("m4", ""),
+                                  ("neo", "../x"), ("", "")):
+            with self.subTest(profile=profile, artifact=artifact):
+                self.assertNotEqual(self.check(profile, artifact), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

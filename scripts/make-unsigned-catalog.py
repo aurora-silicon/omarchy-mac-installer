@@ -8,8 +8,9 @@ repository.
 
 Every per-release value comes from an inputs file (`--inputs`), so cutting a
 release never edits this script. `scripts/release-inputs.template.json` holds
-the current values. The inputs must list exactly the Macs in
-`scripts/supported-models.json`: every M1, M2 and M3 Mac, none refused.
+the current values. The inputs must list every M1, M2 and M3 Mac in
+`scripts/supported-models.json`, none refused. A Mac that boots its own
+image (the MacBook Neo, `hardware_profiles`) never shares the main payload.
 
 The catalog pins whole-file digests. When the payload was split for release
 delivery, the sibling `<payload>.partNN` files are emitted as an additional
@@ -319,6 +320,11 @@ def load_inputs(path: Path, developer: bool = False) -> dict:
     if engine and int(engine.group(1)) >= 18 and parse_version(installer["minimum_version"]) < (2, 1, 0):
         raise SystemExit("this engine requires installer.minimum_version >= 2.1.0")
     download_url = installer["download_url"]
+    if download_url is None:
+        raise SystemExit(
+            f"inputs installer.download_url is not set: app {installer['latest_version']} "
+            "is not released yet; set it to the published app's https URL"
+        )
     if not isinstance(download_url, str) or not download_url.startswith("https://"):
         raise SystemExit(f"inputs installer.download_url must be https: {download_url}")
 
@@ -423,6 +429,9 @@ def main() -> None:
     models, parts = model_group(inputs, inputs, arguments.assets_dir, arguments.base_url)
     for group in inputs.get("developer_models", []):
         models += model_group(inputs, group, arguments.assets_dir, arguments.base_url)[0]
+    errors = supported_models.payload_errors(models)
+    if errors:
+        raise SystemExit("inputs: " + "; ".join(errors))
 
     issued = issue_time(arguments.now)
     installer = inputs["installer"]

@@ -7,9 +7,14 @@ as its own job, so the job that holds the catalog key does nothing but sign:
   prepare         validate the inputs, refuse an image without a passing VM
                   evidence record for its exact sha256, optionally check that
                   every artifact URL serves the pinned bytes, and write the
-                  unsigned catalog-<channel>.json
-  check-evidence  re-check a built catalog's payload digest against the
-                  evidence record (the signing job runs it again)
+                  unsigned catalog-<channel>.json. On edge it may add the
+                  MacBook Neo's own image, gated by a recorded hardware
+                  install instead (scripts/hardware_evidence.py); a Neo image
+                  that fails any check is dropped with a warning, and the
+                  catalog offers the M1, M2 and M3 image alone
+  check-evidence  re-check each payload of a built catalog against its
+                  evidence and the Macs its installer_data.json admits (the
+                  signing job runs it again)
   sign            sign a catalog with the Ed25519 key in an environment
                   variable or file, wrap it in the channel envelope and verify
                   the result against the trust root
@@ -62,6 +67,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+import hardware_evidence  # noqa: E402
 import supported_models  # noqa: E402
 
 IDENTITY = ROOT / "Packaging" / "identity.conf"
@@ -87,6 +93,10 @@ REQUIRED_SCENARIOS = ("first-boot", "conversion", "second-boot")
 SCENARIO_RESULTS = ("pass", "fail", "skip")
 MAXIMUM_PART_COUNT = 16
 MAXIMUM_CATALOG_BYTES = 1_048_576
+MAXIMUM_INSTALLER_DATA_BYTES = 1_048_576
+# The first app release whose edge catalog offers the MacBook Neo its own
+# image (the owner's decision): a catalog with a second image needs it.
+OWN_IMAGE_MINIMUM_INSTALLER = (2, 3, 0)
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -327,6 +337,39 @@ def check_evidence(document: object, image_sha256: str) -> dict:
     return document
 
 
+def check_hardware_evidence(document: object, image: str, image_sha256: str, channel: str,
+                            installer: dict | None) -> dict:
+    """Refuse unless the hardware install record passed for exactly IMAGE
+    (IMAGE_SHA256), on edge, with an app the catalog still admits."""
+    if document is None:
+        raise Refusal(f"no hardware evidence record for {image}: an image the VM cannot boot is published "
+                      "only after a recorded install on its Mac")
+    try:
+        hardware_evidence.check(document, image, image_sha256, channel)
+    except ValueError as error:
+        raise Refusal(str(error)) from None
+    if installer is not None and (version_tuple(document["installer_version"])
+                                  < version_tuple(installer["minimumVersion"])):
+        raise Refusal(f"{image} was installed with app {document['installer_version']}, older than the "
+                      f"catalog's installer.minimumVersion {installer['minimumVersion']}")
+    return document
+
+
+def check_admission(data: bytes, boards: list[str], field: str) -> None:
+    """Refuse unless the installer_data.json DATA admits exactly BOARDS, the
+    Macs the catalog gives its payload."""
+    try:
+        admitted = supported_models.admitted(json.loads(data))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise Refusal(f"{field}: {error}") from None
+    extra = [board for board in admitted if board not in boards]
+    missing = [board for board in boards if board not in admitted]
+    if extra or missing:
+        raise Refusal(f"{field} does not admit exactly the Macs the catalog gives its payload"
+                      + (f"; it also admits {', '.join(extra)}" if extra else "")
+                      + (f"; it refuses {', '.join(missing)}" if missing else ""))
+
+
 def load_json(path: Path | None, field: str) -> object:
     if path is None:
         return None
@@ -341,39 +384,74 @@ def load_json(path: Path | None, field: str) -> object:
 # ── catalog ──────────────────────────────────────────────────────────────────
 
 
-def build_catalog(
-    channel: str,
-    image: str,
-    payload: dict,
-    engine: dict,
-    metadata: dict,
-    evidence: object,
-    installer: dict | None,
-    now: datetime.datetime,
-) -> dict:
-    check_channel(channel)
+def check_image(channel: str, image: str, payload: dict, metadata: dict, installer_data: bytes,
+                profile: str, evidence: object, installer: dict | None) -> dict:
+    """One image of a catalog, checked: its name, artifacts, the Macs its
+    installer_data.json admits (every supported Mac of PROFILE, no other) and
+    its evidence: a passing VM record for the legacy image, a hardware install
+    record for an image with its own profile."""
+    label = "payload" if profile == supported_models.LEGACY else f"{profile}_payload"
     check_image_name(image, channel)
-    payload = check_artifact(payload, "payload", allow_parts=True)
-    metadata = check_artifact(metadata, "installer_data")
+    payload = check_artifact(payload, label, allow_parts=True)
+    metadata = check_artifact(metadata, label.replace("payload", "installer_data"))
+    if hashlib.sha256(installer_data).hexdigest() != metadata["sha256"]:
+        raise Refusal(f"{image}'s installer_data.json is not the pinned {metadata['sha256']}")
+    supported, _ = supported_models.load()
+    boards = [identifier for identifier in supported if supported_models.hardware_profile(identifier) == profile]
+    check_admission(installer_data, boards, f"{image}'s installer_data.json")
+    if profile == supported_models.LEGACY:
+        check_evidence(evidence, payload["sha256"])
+    else:
+        if installer is None or version_tuple(installer["minimumVersion"]) < OWN_IMAGE_MINIMUM_INSTALLER:
+            raise Refusal(f"a catalog with the {profile} image needs installer.minimumVersion >= "
+                          + ".".join(map(str, OWN_IMAGE_MINIMUM_INSTALLER)))
+        check_hardware_evidence(evidence, image, payload["sha256"], channel, installer)
+    return {"image": image, "profile": profile, "payload": payload, "metadata": metadata, "boards": boards}
+
+
+def build_catalog(channel: str, images: list[dict], engine: dict, installer: dict | None,
+                  now: datetime.datetime) -> dict:
+    """The catalog for IMAGES (check_image results, the legacy image first):
+    every supported Mac whose hardware profile has an image, each pinned to
+    its own image's payload and installer_data.json."""
+    check_channel(channel)
     engine = check_engine(engine)
-    check_evidence(evidence, payload["sha256"])
     if installer is not None:
         installer = check_installer(installer, engine["version"])
     elif re.fullmatch(r"v0\.9\.2-omarchy\.(1[89]|[2-9][0-9]|[1-9][0-9]{2,})", engine["version"]):
         raise Refusal("this engine needs app 2.1.0 or later: pass installer with minimumVersion >= 2.1.0")
+    if not images or images[0]["profile"] != supported_models.LEGACY:
+        raise Refusal("a catalog offers the M1, M2 and M3 image first")
+    by_profile = {image["profile"]: image for image in images}
+    for key in ("profile", "image"):
+        if len({image[key] for image in images}) != len(images):
+            raise Refusal(f"two images of the catalog share a {key}")
+    for key in ("payload", "metadata"):
+        if len({image[key]["sha256"] for image in images}) != len(images):
+            raise Refusal(f"two images of the catalog share a {key} digest")
+    if len(images) > 1 and (installer is None
+                            or version_tuple(installer["minimumVersion"]) < OWN_IMAGE_MINIMUM_INSTALLER):
+        raise Refusal("a catalog with more than one image needs installer.minimumVersion >= "
+                      + ".".join(map(str, OWN_IMAGE_MINIMUM_INSTALLER)))
 
     def plain(artifact: dict) -> dict:
         return {"sourceURL": artifact["url"], "fileName": artifact["fileName"], "sizeBytes": artifact["sizeBytes"]}
 
-    payload_artifact = plain(payload)
-    if "parts" in payload:
-        payload_artifact["parts"] = [
-            dict(plain(part), sha256=f"sha256:{part['sha256']}") for part in payload["parts"]
-        ]
+    def payload_artifact(payload: dict) -> dict:
+        document = plain(payload)
+        if "parts" in payload:
+            document["parts"] = [
+                dict(plain(part), sha256=f"sha256:{part['sha256']}") for part in payload["parts"]
+            ]
+        return document
+
     supported, _ = supported_models.load()
     untested = supported_models.untested()
     models = []
     for identifier in supported:
+        image = by_profile.get(supported_models.hardware_profile(identifier))
+        if image is None:
+            continue
         model = {
             "deviceIdentifier": identifier,
             "status": "enabled",
@@ -383,12 +461,12 @@ def build_catalog(
             "downstreamRevision": engine["downstreamRevision"],
             "engineVersion": engine["version"],
             "engineDigest": f"sha256:{engine['artifact']['sha256']}",
-            "metadataDigest": f"sha256:{metadata['sha256']}",
-            "payloadDigest": f"sha256:{payload['sha256']}",
-            "evidenceRevision": image,
+            "metadataDigest": f"sha256:{image['metadata']['sha256']}",
+            "payloadDigest": f"sha256:{image['payload']['sha256']}",
+            "evidenceRevision": image["image"],
             "engineArtifact": plain(engine["artifact"]),
-            "metadataArtifact": plain(metadata),
-            "payloadArtifact": payload_artifact,
+            "metadataArtifact": plain(image["metadata"]),
+            "payloadArtifact": payload_artifact(image["payload"]),
         }
         if identifier in untested:
             # The app ignores keys it does not know; ticket 12 shows this.
@@ -415,14 +493,31 @@ def catalog_bytes(catalog: dict) -> bytes:
     return data
 
 
-def catalog_payload_digest(catalog: dict) -> str:
-    digests = {model.get("payloadDigest") for model in catalog.get("models", [])}
-    if len(digests) != 1:
-        raise Refusal("the catalog must pin exactly one payload digest")
-    digest = digests.pop()
-    if not isinstance(digest, str) or not digest.startswith("sha256:") or not SHA256.match(digest[7:]):
-        raise Refusal(f"the catalog's payload digest is malformed: {digest}")
-    return digest[7:]
+def catalog_images(catalog: dict) -> list[dict]:
+    """Each image a catalog pins: its payload and installer_data digests, its
+    name, hardware profile and Macs, refusing models of one payload that
+    disagree on the rest."""
+    errors = supported_models.catalog_errors(catalog)
+    if errors:
+        raise Refusal("; ".join(errors))
+    images: dict[str, dict] = {}
+    for model in catalog["models"]:
+        digests = (model.get("payloadDigest"), model.get("metadataDigest"))
+        for digest in digests:
+            if not isinstance(digest, str) or not digest.startswith("sha256:") or not SHA256.match(digest[7:]):
+                raise Refusal(f"model {model.get('deviceIdentifier')} pins a malformed digest: {digest}")
+        image = images.setdefault(digests[0][7:], {
+            "payload_sha256": digests[0][7:], "metadata_sha256": digests[1][7:],
+            "image": model.get("evidenceRevision"), "boards": [],
+            "profile": supported_models.hardware_profile(model["deviceIdentifier"]),
+        })
+        if (image["metadata_sha256"], image["image"]) != (digests[1][7:], model.get("evidenceRevision")):
+            raise Refusal(f"the models of payload {digests[0]} pin different installer_data or images")
+        image["boards"].append(model["deviceIdentifier"])
+    profiles = [image["profile"] for image in images.values()]
+    if profiles.count(supported_models.LEGACY) != 1 or len(set(profiles)) != len(profiles):
+        raise Refusal("the catalog must pin one image per hardware profile, the M1, M2 and M3 image among them")
+    return list(images.values())
 
 
 # ── promotion ────────────────────────────────────────────────────────────────
@@ -543,7 +638,7 @@ def open_url(url: str, timeout: float = 60):
     return opener.open(request, timeout=timeout)
 
 
-def remote_digest(url: str, expected_size: int, whole=None) -> tuple[str, int]:
+def remote_digest(url: str, expected_size: int, whole=None, copy=None) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
     with open_url(url) as response:
@@ -554,15 +649,18 @@ def remote_digest(url: str, expected_size: int, whole=None) -> tuple[str, int]:
             digest.update(block)
             if whole is not None:
                 whole.update(block)
+            if copy is not None:
+                copy.extend(block)
     return digest.hexdigest(), size
 
 
-def verify_remote_artifact(artifact: dict, field: str) -> None:
-    """Download ARTIFACT (or its parts) and check every pinned size and digest."""
+def verify_remote_artifact(artifact: dict, field: str, copy: bytearray | None = None) -> None:
+    """Download ARTIFACT (or its parts) and check every pinned size and
+    digest, keeping the bytes in COPY when given."""
     whole = hashlib.sha256()
     pieces = artifact.get("parts") or [artifact]
     for piece in pieces:
-        digest, size = remote_digest(piece["url"], piece["sizeBytes"], whole)
+        digest, size = remote_digest(piece["url"], piece["sizeBytes"], whole, copy)
         if (digest, size) != (piece["sha256"], piece["sizeBytes"]):
             raise Refusal(
                 f"{field}: {piece['url']} serves sha256 {digest} ({size} bytes), "
@@ -862,6 +960,27 @@ def check_repository() -> None:
         raise Refusal(f"catalogs are released from {stopgap_repo()}, not {repository}")
 
 
+def installer_data_bytes(metadata: dict, field: str, verify_remote: bool, directory: Path | None) -> bytes:
+    """An image's installer_data.json, which the board check reads: as its
+    URL serves it with --verify-remote, otherwise <sha256>.json in DIRECTORY."""
+    metadata = check_artifact(metadata, field)
+    if metadata["sizeBytes"] > MAXIMUM_INSTALLER_DATA_BYTES:
+        raise Refusal(f"{field} is larger than {MAXIMUM_INSTALLER_DATA_BYTES} bytes")
+    if verify_remote:
+        copy = bytearray()
+        verify_remote_artifact(metadata, field, copy)
+        return bytes(copy)
+    if directory is None:
+        raise Refusal(f"the board check needs {field}: pass --verify-remote or --installer-data-dir")
+    path = directory / f"{metadata['sha256']}.json"
+    if not path.is_file() or path.is_symlink():
+        raise Refusal(f"{field}: missing or unsafe file {path}")
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != metadata["sha256"]:
+        raise Refusal(f"{path} is not the pinned {field}")
+    return data
+
+
 def command_prepare(arguments) -> None:
     check_repository()
     channel = check_channel(arguments.channel)
@@ -875,11 +994,41 @@ def command_prepare(arguments) -> None:
     metadata = load_json(arguments.installer_data, "installer_data")
     evidence = load_json(arguments.evidence, "evidence") if arguments.evidence else None
     installer = load_json(arguments.installer, "installer") if arguments.installer else None
-    catalog = build_catalog(channel, arguments.image, payload, engine, metadata, evidence, installer, now)
+    checked_engine = check_engine(engine)
+    if installer is not None:
+        installer = check_installer(installer, checked_engine["version"])
+    copies = {}
+    data = installer_data_bytes(metadata, "installer_data", arguments.verify_remote, arguments.installer_data_dir)
+    images = [check_image(channel, arguments.image, payload, metadata, data, supported_models.LEGACY,
+                          evidence, installer)]
+    copies[images[0]["metadata"]["sha256"]] = data
+    neo = "not offered (no Neo image input)"
+    if arguments.neo_image:
+        # A Neo image that fails a check never holds back the M1, M2 and M3
+        # image: the catalog goes out without it.
+        try:
+            neo_metadata = load_json(arguments.neo_installer_data, "neo_installer_data")
+            neo_data = installer_data_bytes(neo_metadata, "neo_installer_data", arguments.verify_remote,
+                                            arguments.installer_data_dir)
+            image = check_image(channel, arguments.neo_image, load_json(arguments.neo_payload, "neo_payload"),
+                                neo_metadata, neo_data, "neo",
+                                load_json(arguments.neo_evidence, "neo_evidence") if arguments.neo_evidence else None,
+                                installer)
+            if image["image"] == images[0]["image"] or image["payload"]["sha256"] == images[0]["payload"]["sha256"]:
+                raise Refusal("the Neo image is the M1, M2 and M3 image")
+            if arguments.verify_remote:
+                verify_remote_artifact(image["payload"], "neo_payload")
+        except Refusal as error:
+            neo = f"dropped: {error}"
+            print(f"warning: the Neo image is left out of the catalog: {error}", file=sys.stderr)
+        else:
+            images.append(image)
+            copies[image["metadata"]["sha256"]] = neo_data
+            neo = f"included {image['image']} {image['payload']['sha256']}"
+    catalog = build_catalog(channel, images, engine, installer, now)
     if arguments.verify_remote:
-        verify_remote_artifact(check_artifact(payload, "payload", True), "payload")
-        verify_remote_artifact(check_engine(engine)["artifact"], "engine")
-        verify_remote_artifact(check_artifact(metadata, "installer_data"), "installer_data")
+        verify_remote_artifact(images[0]["payload"], "payload")
+        verify_remote_artifact(checked_engine["artifact"], "engine")
     if arguments.check_live:
         trust_root = read_trust_root(arguments.trust_root)
         live = live_sequence(catalog_host(arguments.host), channel, trust_root, find_openssl())
@@ -887,23 +1036,43 @@ def command_prepare(arguments) -> None:
             raise Refusal(f"sequence {catalog['sequence']} does not follow the published {live}")
     data = catalog_bytes(catalog)
     arguments.out.mkdir(parents=True, exist_ok=True)
+    # The signing job's board check reads these.
+    (arguments.out / "installer-data").mkdir(exist_ok=True)
+    for digest, document in copies.items():
+        (arguments.out / "installer-data" / f"{digest}.json").write_bytes(document)
     output = arguments.out / f"catalog-{channel}.json"
     output.write_bytes(data)
     print(f"catalog={output}")
     print(f"catalog_sha256={hashlib.sha256(data).hexdigest()}")
     print(f"sequence={catalog['sequence']}")
     print(f"image={arguments.image}")
-    print(f"payload_sha256={payload['sha256']}")
+    print(f"payload_sha256={images[0]['payload']['sha256']}")
+    print(f"neo={neo}")
     print(f"models={len(catalog['models'])} untested={sum('previewNote' in m for m in catalog['models'])}")
 
 
 def command_check_evidence(arguments) -> None:
     # Evidence gates only the catalogs built from an image: edge.
-    check_channel(arguments.catalog.name.removeprefix("catalog-").removesuffix(".json"))
+    channel = check_channel(arguments.catalog.name.removeprefix("catalog-").removesuffix(".json"))
     catalog = load_json(arguments.catalog, "catalog")
-    digest = catalog_payload_digest(catalog)
-    check_evidence(load_json(arguments.evidence, "evidence") if arguments.evidence else None, digest)
-    print(f"evidence=passed {digest}")
+    if not isinstance(catalog, dict):
+        raise Refusal("the catalog is not a JSON object")
+    evidence = load_json(arguments.evidence, "evidence") if arguments.evidence else None
+    neo_evidence = load_json(arguments.neo_evidence, "neo_evidence") if arguments.neo_evidence else None
+    for image in catalog_images(catalog):
+        path = arguments.installer_data_dir / f"{image['metadata_sha256']}.json"
+        if not path.is_file() or path.is_symlink():
+            raise Refusal(f"no installer_data.json for {image['image']} at {path}")
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != image["metadata_sha256"]:
+            raise Refusal(f"{path} is not the installer_data.json the catalog pins for {image['image']}")
+        check_admission(data, image["boards"], f"{image['image']}'s installer_data.json")
+        if image["profile"] == supported_models.LEGACY:
+            check_evidence(evidence, image["payload_sha256"])
+        else:
+            check_hardware_evidence(neo_evidence, image["image"], image["payload_sha256"], channel,
+                                    catalog.get("installer"))
+        print(f"evidence=passed {image['payload_sha256']} ({image['profile']}, {len(image['boards'])} Macs)")
 
 
 def command_sign(arguments) -> None:
@@ -1096,6 +1265,12 @@ def parse_arguments(argv: list[str]):
     prepare.add_argument("--installer-data", type=Path, required=True)
     prepare.add_argument("--evidence", type=Path)
     prepare.add_argument("--installer", type=Path)
+    prepare.add_argument("--installer-data-dir", type=Path,
+                         help="<sha256>.json copies of the installer_data files, without --verify-remote")
+    prepare.add_argument("--neo-image", default="")
+    prepare.add_argument("--neo-payload", type=Path)
+    prepare.add_argument("--neo-installer-data", type=Path)
+    prepare.add_argument("--neo-evidence", type=Path, help="the Neo image's hardware install record")
     prepare.add_argument("--verify-remote", action="store_true")
     prepare.add_argument("--check-live", action="store_true")
     prepare.add_argument("--host", default="github-release")
@@ -1127,6 +1302,8 @@ def parse_arguments(argv: list[str]):
     evidence = commands.add_parser("check-evidence")
     evidence.add_argument("--catalog", type=Path, required=True)
     evidence.add_argument("--evidence", type=Path)
+    evidence.add_argument("--neo-evidence", type=Path)
+    evidence.add_argument("--installer-data-dir", type=Path, required=True)
 
     for name in ("sign", "public-key"):
         command = commands.add_parser(name)

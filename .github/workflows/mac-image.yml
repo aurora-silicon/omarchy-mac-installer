@@ -5,16 +5,29 @@ name: Mac image (edge)
 # checked against it and the Omarchy package key), runs the release guard, and
 # keeps the image, its records and a build provenance attestation as workflow
 # artifacts. It publishes nothing: no release, no catalog, no upload. It uses
-# no secrets, takes no inputs, and never runs for pull requests.
+# no secrets and never runs for pull requests.
 #
-# Started by hand, or called by the release pipeline (mac-release-pipeline.yml,
-# which edge-dispatch.yml starts when an edge publish changes a package the
-# image installs). A caller grants contents: read, id-token: write and
+# Started by hand (the M1, M2 and M3 image), or called by the release pipeline
+# (mac-release-pipeline.yml, which edge-dispatch.yml starts when an edge
+# publish changes a package the image installs) once per hardware profile:
+# legacy, the image every M1, M2 and M3 Mac takes, and neo, the MacBook Neo's
+# own image, which also takes the native Recovery app as an artifact of the
+# calling run (the pipeline's Recovery job, as neo-image.yml builds it). A
+# caller grants contents: read, id-token: write and
 # attestations: write; the attestation's signer workflow is this file either
 # way, which is what the upload checks.
 
 on:
   workflow_call:
+    inputs:
+      hardware-profile:
+        description: legacy (every M1, M2 and M3 Mac) or neo (the MacBook Neo's own image)
+        type: string
+        default: legacy
+      recovery-app-artifact:
+        description: Neo only, the calling run's artifact holding native-recovery.tar (Recovery/build-recovery.sh)
+        type: string
+        default: ''
     outputs:
       name:
         description: The image name and artifact name, omarchy-mac-edge-<YYYY.MM.DD>-<set id>
@@ -25,13 +38,16 @@ on:
       sha256:
         description: The image zip's sha256
         value: ${{ jobs.build.outputs.sha256 }}
+      hardware-profile:
+        description: The hardware profile IMAGE records
+        value: ${{ jobs.build.outputs.hardware-profile }}
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: mac-image-edge
+  group: mac-image-edge-${{ inputs.hardware-profile || 'legacy' }}
   cancel-in-progress: false
 
 defaults:
@@ -40,7 +56,7 @@ defaults:
 
 jobs:
   build:
-    name: Build the edge image
+    name: Build the edge image (${{ inputs.hardware-profile || 'legacy' }})
     # Namespace's runners are ours: nothing a pull request starts reaches
     # them, and a build starts only from main, as the acceptance of its image.
     if: >-
@@ -57,10 +73,26 @@ jobs:
       name: ${{ steps.stage.outputs.name }}
       payload: ${{ steps.stage.outputs.payload }}
       sha256: ${{ steps.stage.outputs.sha256 }}
+      hardware-profile: ${{ steps.stage.outputs.hardware-profile }}
+    env:
+      HARDWARE_PROFILE: ${{ inputs.hardware-profile || 'legacy' }}
+      RECOVERY_ARTIFACT: ${{ inputs.recovery-app-artifact }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+
+      - name: Check the hardware profile
+        run: |
+          set -euo pipefail
+          case "$HARDWARE_PROFILE:$RECOVERY_ARTIFACT" in
+            legacy:) ;;
+            neo:?*) [[ $RECOVERY_ARTIFACT =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] ;;
+            *)
+              echo "::error::hardware-profile is legacy, or neo with its recovery-app-artifact, not '$HARDWARE_PROFILE' with '$RECOVERY_ARTIFACT'"
+              exit 1
+              ;;
+          esac
 
       - name: Record the host
         run: |
@@ -85,16 +117,32 @@ jobs:
           command -v bsdtar >/dev/null || { sudo apt-get update -q && sudo apt-get install --yes -q libarchive-tools; }
           command -v jq gpg curl sha256sum
 
+      - name: Download the Recovery app
+        if: inputs.recovery-app-artifact != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.recovery-app-artifact }}
+          path: ${{ runner.temp }}/mac-image/recovery
+
       - name: Resolve the edge inputs
         run: |
           set -euo pipefail
-          bash image-builder/bin/mac-image-inputs resolve "$WORK/inputs" --channel-set --channel edge --cache "$WORK/cache"
+          recovery=()
+          if [[ -n $RECOVERY_ARTIFACT ]]; then
+            tar -xf "$WORK/recovery/native-recovery.tar" -C "$WORK/recovery"
+            cp "$WORK/recovery/source.txt" "$WORK/evidence/recovery-source.txt"
+            recovery=(--recovery-app "$WORK/recovery")
+          fi
+          bash image-builder/bin/mac-image-inputs resolve "$WORK/inputs" --channel-set --channel edge \
+            --hardware-profile "$HARDWARE_PROFILE" "${recovery[@]}" --cache "$WORK/cache"
           tee "$WORK/evidence/inputs" <"$WORK/inputs"
 
       - name: Build the image
         run: |
           set -euo pipefail
-          bash image-builder/bin/build-mac-image --inputs "$WORK/inputs" --cache "$WORK/cache" "$WORK/out" 2>&1 |
+          recovery=()
+          [[ -z $RECOVERY_ARTIFACT ]] || recovery=(--recovery-app "$WORK/recovery")
+          bash image-builder/bin/build-mac-image --inputs "$WORK/inputs" "${recovery[@]}" --cache "$WORK/cache" "$WORK/out" 2>&1 |
             tee "$WORK/evidence/build.log"
 
       - name: Check the records
@@ -133,6 +181,9 @@ jobs:
           (cd "$stage" && sha256sum "$zip" >"$zip.sha256")
           sha256=$(cut -d' ' -f1 "$stage/$zip.sha256")
           [[ $zip =~ ^omarchy-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-aarch64-apple-silicon-mac-edge-os-package\.zip$ && $sha256 =~ ^[0-9a-f]{64}$ ]]
+          # The upload holds a Neo image's hardware evidence to this record.
+          grep -qx "hardware_profile=$HARDWARE_PROFILE" "$WORK/out/IMAGE" ||
+            { echo "::error::IMAGE does not record hardware_profile=$HARDWARE_PROFILE"; exit 1; }
           for file in installer_data.json IMAGE PROVENANCE INSPECTION inputs; do
             cp "$WORK/out/$file" "$stage/"
           done
@@ -143,9 +194,10 @@ jobs:
             echo "stage=$stage"
             echo "payload=$zip"
             echo "sha256=$sha256"
+            echo "hardware-profile=$HARDWARE_PROFILE"
           } >>"$GITHUB_OUTPUT"
           {
-            echo "### \`$name\`"
+            echo "### \`$name\` ($HARDWARE_PROFILE)"
             echo '```'
             echo "payload $zip, $(stat -c %s "$stage/$zip") bytes"
             echo "sha256  $sha256"
@@ -177,7 +229,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mac-image-evidence
+          name: mac-image-evidence-${{ env.HARDWARE_PROFILE }}
           path: ${{ runner.temp }}/mac-image/evidence/
           if-no-files-found: warn
           retention-days: 14

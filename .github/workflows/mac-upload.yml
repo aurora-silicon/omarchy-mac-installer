@@ -13,6 +13,13 @@ name: Mac image upload
 # and without the image's build attestation from mac-image.yml on main. A dry run (the default) writes only to a
 # `dryrun-` scratch draft release that it deletes afterwards.
 #
+# The MacBook Neo's image is the exception: the VM harness cannot boot it, so
+# its gate is a hardware install record (scripts/hardware_evidence.py), the
+# hardware-evidence input, which the dispatcher of the release pipeline
+# supplies. mac-upload.py holds it to the image's sha256 and name, and to the
+# one Mac the image's IMAGE and installer_data.json are built for, and
+# publishes it beside the image as hardware-evidence.json.
+#
 # With make-public, a real upload then publishes the draft as a prerelease
 # (never latest) so the catalog can pin its download URLs, and outputs the
 # catalog's payload and installer-data inputs and the evidence it checked.
@@ -48,6 +55,11 @@ on:
         default: ''
       evidence-run-id:
         description: Run that uploaded the evidence artifact (empty for this run)
+        type: string
+        required: false
+        default: ''
+      hardware-evidence:
+        description: In place of evidence-artifact, for an image the VM cannot boot - its hardware install record (JSON)
         type: string
         required: false
         default: ''
@@ -100,6 +112,10 @@ on:
         description: Run that uploaded the evidence artifact
         type: string
         default: ''
+      hardware-evidence:
+        description: In place of evidence-artifact, for an image the VM cannot boot - its hardware install record (JSON)
+        type: string
+        default: ''
       part-bytes:
         description: Dry run only, a smaller part size
         type: string
@@ -146,6 +162,7 @@ jobs:
       IMAGE_RUN_ID: ${{ inputs.image-run-id }}
       EVIDENCE_ARTIFACT: ${{ inputs.evidence-artifact }}
       EVIDENCE_RUN_ID: ${{ inputs.evidence-run-id }}
+      HARDWARE_EVIDENCE: ${{ inputs.hardware-evidence }}
       PART_BYTES: ${{ inputs.part-bytes }}
       DRY_RUN: ${{ inputs.dry-run }}
     steps:
@@ -170,8 +187,12 @@ jobs:
             echo "::error::refusing to upload: a real upload runs only from main, not $GITHUB_REF"
             exit 1
           fi
-          if [[ $DRY_RUN != "true" && -z $EVIDENCE_ARTIFACT ]]; then
+          if [[ $DRY_RUN != "true" && -z $EVIDENCE_ARTIFACT && -z $HARDWARE_EVIDENCE ]]; then
             echo "::error::refusing to upload: no acceptance evidence for this image"
+            exit 1
+          fi
+          if [[ -n $EVIDENCE_ARTIFACT && -n $HARDWARE_EVIDENCE ]]; then
+            echo "::error::an image has acceptance evidence or a hardware install record, not both"
             exit 1
           fi
           if [[ $DRY_RUN == "true" ]]; then
@@ -191,6 +212,8 @@ jobs:
           mkdir -p "$WORK"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/${IMAGE_RUN_ID:-$GITHUB_RUN_ID}" >"$WORK/image-run.json"
           python3 -I scripts/mac-upload.py check-run --run-json "$WORK/image-run.json" --repository "$GITHUB_REPOSITORY" --role image --current-run-id "$GITHUB_RUN_ID"
+          # A hardware install record comes from no run.
+          [[ -n $EVIDENCE_ARTIFACT ]] || exit 0
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/${EVIDENCE_RUN_ID:-$GITHUB_RUN_ID}" >"$WORK/evidence-run.json"
           python3 -I scripts/mac-upload.py check-run --run-json "$WORK/evidence-run.json" --repository "$GITHUB_REPOSITORY" --role evidence --current-run-id "$GITHUB_RUN_ID"
 
@@ -211,6 +234,13 @@ jobs:
           path: ${{ runner.temp }}/mac-upload/evidence
           github-token: ${{ inputs.evidence-run-id != '' && github.token || '' }}
           run-id: ${{ inputs.evidence-run-id }}
+
+      - name: Write the hardware install record
+        if: inputs.hardware-evidence != ''
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/hardware"
+          printf '%s\n' "$HARDWARE_EVIDENCE" >"$WORK/hardware/hardware-evidence.json"
 
       - name: Verify the image's build attestation
         env:
@@ -272,6 +302,8 @@ jobs:
             [[ -f $WORK/evidence/acceptance-evidence.json ]] || { echo "::error::$EVIDENCE_ARTIFACT holds no acceptance-evidence.json"; exit 1; }
             args+=(--evidence "$WORK/evidence/acceptance-evidence.json"
               --evidence-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${EVIDENCE_RUN_ID:-$GITHUB_RUN_ID}")
+          elif [[ -n $HARDWARE_EVIDENCE ]]; then
+            args+=(--hardware-evidence "$WORK/hardware/hardware-evidence.json")
           fi
           TMPDIR=$RUNNER_TEMP python3 -I scripts/mac-upload.py "${args[@]}"
           {
@@ -300,7 +332,9 @@ jobs:
           set -euo pipefail
           python3 -I scripts/mac-upload.py catalog-inputs --report "$WORK/report.json" \
             --destination "github-release:$GITHUB_REPOSITORY" --release "$RELEASE" | tee -a "$GITHUB_OUTPUT"
-          echo "evidence=$(jq -c . "$WORK/evidence/acceptance-evidence.json")" | tee -a "$GITHUB_OUTPUT"
+          record=$WORK/evidence/acceptance-evidence.json
+          [[ -z $HARDWARE_EVIDENCE ]] || record=$WORK/hardware/hardware-evidence.json
+          echo "evidence=$(jq -c . "$record")" | tee -a "$GITHUB_OUTPUT"
 
       - name: Delete the scratch release
         if: always() && inputs.dry-run && steps.inputs.outputs.release != ''

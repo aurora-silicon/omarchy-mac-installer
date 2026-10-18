@@ -43,5 +43,36 @@
         try AppleInstallerTrustCore().validateSupportCatalog(
           payload: tampered, signature: documents.signature, trustRoot: trustRoot, now: Date()))
     }
+
+    /// Fixtures/ci-signed-catalog-neo: the same path's edge catalog with the
+    /// MacBook Neo's own image beside the M1, M2 and M3 one.
+    func testTheAppTakesEachMacsOwnImageFromATwoImageCatalog() throws {
+      let fixtures = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures", withExtension: nil))
+        .appendingPathComponent("ci-signed-catalog-neo")
+      let publicKey = try Data(
+        contentsOf: fixtures.appendingPathComponent("trust-root.ed25519.pub"))
+      let documents = try SignedCatalogEnvelope.decode(
+        Data(contentsOf: fixtures.appendingPathComponent("catalog-edge.signed.json")))
+      let trustRoot = try AppOwnedTrustRoot(
+        rawRepresentation: publicKey,
+        expectedFingerprint: SHA256Digest(hashing: publicKey).rawValue)
+
+      let catalog = try AppleInstallerTrustCore().validateSupportCatalog(
+        payload: documents.payload, signature: documents.signature,
+        trustRoot: trustRoot, now: Date())
+
+      XCTAssertEqual(catalog.deviceIdentifiers.count, 35)
+      guard case .admitted(let m1) = catalog.admission(for: "apple,j274"),
+        case .admitted(let neo) = catalog.admission(for: "apple,j700")
+      else { return XCTFail("the M1 and the Neo must be admitted") }
+      XCTAssertEqual(m1.evidenceRevision, "omarchy-mac-edge-2026.10.14-0123456789ab")
+      XCTAssertEqual(neo.evidenceRevision, "omarchy-mac-edge-2026.10.14-fedcba987654")
+      XCTAssertNotEqual(neo.payloadDigest, m1.payloadDigest)
+      XCTAssertNotEqual(neo.metadataDigest, m1.metadataDigest)
+      XCTAssertEqual(neo.payloadDigest, neo.delivery?.payload.expectedDigest)
+      XCTAssertEqual(neo.delivery?.payload.parts.count, 0)
+      XCTAssertEqual(m1.delivery?.payload.parts.count, 2)
+      XCTAssertEqual(neo.engineDigest, m1.engineDigest)
+    }
   }
 #endif

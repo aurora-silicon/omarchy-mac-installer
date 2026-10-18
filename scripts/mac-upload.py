@@ -14,7 +14,10 @@ them to a destination:
 - `<zip>.sha256`, the build's whole-image digest line;
 - the image records: installer_data.json, IMAGE, PROVENANCE, INSPECTION,
   inputs;
-- `acceptance-evidence.json` when evidence was given;
+- `acceptance-evidence.json` when evidence was given, or
+  `hardware-evidence.json` for an image the VM cannot boot (the MacBook
+  Neo's), whose gate is a recorded install on its Mac
+  (`scripts/hardware_evidence.py`);
 - `SHA256SUMS`, last, over every file above and the whole zip.
 
 Every destination path is immutable. Before writing anything the job lists
@@ -23,7 +26,9 @@ with different bytes (or a file this upload doesn't have) refuses the whole
 upload. After uploading, every file is downloaded back and its sha256 checked.
 
 A real upload refuses without passing acceptance evidence for the image's
-sha256 (`docs/mac-acceptance-evidence.md`). A dry run writes only to a
+sha256 (`docs/mac-acceptance-evidence.md`), or a hardware install record for
+it whose board is the one Mac the image's installer_data.json admits. A dry
+run writes only to a
 scratch release whose name starts with `dryrun-`, which it deletes
 afterwards.
 
@@ -39,7 +44,8 @@ Usage:
                           [--current-run-id ID]
   mac-upload.py publish --artifact DIR --image NAME --sha256 HEX
                         --destination DEST --release NAME [--dry-run]
-                        [--evidence FILE --evidence-run-url URL]
+                        [--evidence FILE --evidence-run-url URL |
+                         --hardware-evidence FILE]
                         [--part-bytes N] [--target SHA]
                         [--run-url URL] [--report FILE]
   mac-upload.py discard --destination DEST --release NAME
@@ -65,6 +71,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Protocol
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hardware_evidence  # noqa: E402
+import supported_models  # noqa: E402
+
 GITHUB_PART_BYTES = 1992294400
 MAXIMUM_PART_COUNT = 16
 READ_BLOCK_BYTES = 8 * 1024 * 1024
@@ -78,6 +88,7 @@ RELEASE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PAYLOAD_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,200}\.zip$")
 RECORDS = ("installer_data.json", "IMAGE", "PROVENANCE", "INSPECTION", "inputs")
 EVIDENCE_NAME = "acceptance-evidence.json"
+HARDWARE_EVIDENCE_NAME = "hardware-evidence.json"
 SUMS_NAME = "SHA256SUMS"
 REQUIRED_SCENARIOS = ("first-boot", "conversion", "second-boot")
 DRY_RUN_PREFIX = "dryrun-"
@@ -169,6 +180,26 @@ def load_evidence(path: Path, expected_sha256: str, expected_run_url: str = "") 
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise Refusal(f"the evidence record is not JSON: {error}") from error
     check_evidence(document, expected_sha256, expected_run_url)
+    return document
+
+
+def load_hardware_evidence(path: Path, image: str, expected_sha256: str, artifact: Path) -> dict:
+    """Refuse unless the hardware install record passed for this image and
+    its board is the one Mac the artifact's image is built for and admits."""
+    require(path.is_file() and not path.is_symlink(), f"missing or unsafe hardware evidence record: {path}")
+    try:
+        document = json.loads(path.read_text())
+        hardware_evidence.check(document, image, expected_sha256, IMAGE_NAME.fullmatch(image).group(1))
+        board = document["board"]
+        fields = dict(line.split("=", 1) for line in (artifact / "IMAGE").read_text().splitlines() if "=" in line)
+        require(fields.get("hardware_profile", supported_models.LEGACY) == supported_models.hardware_profile(board),
+                f"the image is not built with {board}'s hardware profile")
+        admitted = supported_models.admitted(json.loads((artifact / "installer_data.json").read_text()))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Refusal(f"the hardware evidence record or the image's records are not readable: {error}") from error
+    except ValueError as error:
+        raise Refusal(str(error)) from error
+    require(admitted == [board], f"the image admits {', '.join(admitted) or 'no Mac'}, not only {board}")
     return document
 
 
@@ -495,7 +526,8 @@ def split(payload: Path, part_bytes: int, staging: Path) -> list[Path]:
     return parts
 
 
-def stage(artifact: Path, expected_sha256: str, evidence: Path | None, part_bytes: int | None, staging: Path) -> list[Path]:
+def stage(artifact: Path, expected_sha256: str, evidence: Path | None, part_bytes: int | None, staging: Path,
+          evidence_name: str = EVIDENCE_NAME) -> list[Path]:
     """Check the artifact and lay out the files to publish, SHA256SUMS last."""
     payload = find_payload(artifact)
     actual = sha256_of(payload)
@@ -517,7 +549,7 @@ def stage(artifact: Path, expected_sha256: str, evidence: Path | None, part_byte
         files.append(payload)
     files += [digest_file] + [artifact / record for record in RECORDS]
     if evidence is not None:
-        copy = staging / EVIDENCE_NAME
+        copy = staging / evidence_name
         shutil.copyfile(evidence, copy)
         files.append(copy)
     names = [path.name for path in files]
@@ -588,16 +620,21 @@ def probe_refusals(files: list[Path], destination: Destination, staging: Path) -
 
 def publish(*, artifact: Path, image: str, sha256: str, destination: Destination, release: str, dry_run: bool,
             evidence: Path | None = None, evidence_run_url: str = "", part_bytes: int | None = None,
-            work: Path | None = None) -> dict:
+            work: Path | None = None, hardware_evidence: Path | None = None) -> dict:
     check_inputs(image, sha256, dry_run, [], str(part_bytes) if part_bytes else "")
     if dry_run:
         require(release.startswith(DRY_RUN_PREFIX), f"a dry run writes only to a {DRY_RUN_PREFIX} scratch release, not {release}")
     else:
         require(release == image, f"a real upload goes to the release named after the image ({image}), not {release}")
+    require(evidence is None or hardware_evidence is None, "an image has acceptance evidence or a hardware install record, not both")
     record = None
+    evidence_name = EVIDENCE_NAME
     if evidence is not None:
         require(dry_run or evidence_run_url != "", "a real upload needs the URL of the run the evidence came from")
         record = load_evidence(evidence, sha256, evidence_run_url)
+    elif hardware_evidence is not None:
+        record = load_hardware_evidence(hardware_evidence, image, sha256, artifact)
+        evidence, evidence_name = hardware_evidence, HARDWARE_EVIDENCE_NAME
     else:
         require(dry_run, "refusing to upload: no acceptance evidence for this image")
         print("  dry run without acceptance evidence: a real upload would refuse")
@@ -606,7 +643,7 @@ def publish(*, artifact: Path, image: str, sha256: str, destination: Destination
     with tempfile.TemporaryDirectory(prefix="mac-upload-", dir=work) as scratch:
         staging = Path(scratch)
         try:
-            files = stage(artifact, sha256, evidence, limit, staging)
+            files = stage(artifact, sha256, evidence, limit, staging, evidence_name)
             missing = plan(files, destination.listing(), destination)
             for path in missing:
                 print(f"  uploading {path.name} ({path.stat().st_size} bytes)")
@@ -628,7 +665,9 @@ def publish(*, artifact: Path, image: str, sha256: str, destination: Destination
             "destination": destination.location(),
             "files": [{"name": path.name, "size": path.stat().st_size, "sha256": sha256_of(path)} for path in files],
             "uploaded": [path.name for path in missing],
-            "evidence": None if record is None else {key: record.get(key) for key in ("result", "harness_commit", "runner", "run_url")},
+            "evidence": None if record is None else {key: record.get(key) for key in (
+                ("result", "harness_commit", "runner", "run_url") if evidence_name == EVIDENCE_NAME
+                else ("result", "kind", "board", "installer_version", "tester"))},
         }
 
 
@@ -706,6 +745,7 @@ def main(argv: list[str]) -> int:
     upload.add_argument("--dry-run", action="store_true")
     upload.add_argument("--evidence", type=Path)
     upload.add_argument("--evidence-run-url", default="")
+    upload.add_argument("--hardware-evidence", type=Path)
     upload.add_argument("--part-bytes", default="")
     upload.add_argument("--target", default="")
     upload.add_argument("--run-url", default="")
@@ -739,7 +779,7 @@ def main(argv: list[str]) -> int:
                                            notes=release_notes(args.image, args.sha256, args.run_url))
             report = publish(artifact=args.artifact, image=args.image, sha256=args.sha256, destination=destination,
                              release=args.release, dry_run=args.dry_run, evidence=args.evidence,
-                             evidence_run_url=args.evidence_run_url,
+                             evidence_run_url=args.evidence_run_url, hardware_evidence=args.hardware_evidence,
                              part_bytes=int(args.part_bytes) if args.part_bytes else None)
             if args.report:
                 args.report.write_text(json.dumps(report, indent=2) + "\n")

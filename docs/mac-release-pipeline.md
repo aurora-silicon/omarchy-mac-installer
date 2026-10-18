@@ -1,6 +1,6 @@
 # Mac release pipeline
 
-`.github/workflows/mac-release-pipeline.yml` runs one edge image from build to a signed edge catalog. `edge-dispatch.yml` starts it (`dry-run=false`, on `main`) when an edge publish changes a package the image installs. You can also start it by hand, and a manual run is a dry run unless you say otherwise. The only manual step is the owner's approval of the catalog signature.
+`.github/workflows/mac-release-pipeline.yml` runs one edge image, the one every M1, M2 and M3 Mac takes, from build to a signed edge catalog, and beside it builds the MacBook Neo's own image, which the edge catalog offers once a recorded install on a real Neo vouches for it (see [The MacBook Neo image](#the-macbook-neo-image)). `edge-dispatch.yml` starts it (`dry-run=false`, on `main`) when an edge publish changes a package the image installs. You can also start it by hand, and a manual run is a dry run unless you say otherwise. The only manual step is the owner's approval of the catalog signature.
 
 | Job | Workflow | Runs when | Gates it keeps |
 | --- | --- | --- | --- |
@@ -9,7 +9,12 @@
 | `acceptance` | `mac-acceptance.yml` | after `build` | main only, never for a pull request; the zip's sha256 and build attestation checked; the VM harness's `fresh-install` scenarios on the VM runner ([runner](mac-acceptance-runner.md)); fails unless the evidence record for the zip's sha256 passes; a passing record is attested |
 | `catalog-inputs` | here | acceptance passed | `.github/mac-release-pipeline.json` must name an app release (a dry run only notes it), before anything is public |
 | `upload` | `mac-upload.yml` | acceptance `result == pass`, catalog inputs read | `publish` environment (main only); evidence and attestation re-checked; never overwrites; publishes the draft as a prerelease (never latest) on a real run |
-| `catalog` | `mac-catalog.yml` | real run, all of the above succeeded | evidence re-checked for the payload's digest; every URL serves its pinned bytes; `catalog-release` (owner approval, main only) signs |
+| `neo-recovery` | here | after `plan` | builds the native Recovery app on `macos-26`, as `neo-image.yml` does |
+| `neo-build` | `mac-image.yml` (`hardware-profile: neo`) | after `neo-recovery` | the same build, release guard and attestation as `build`; IMAGE must record `hardware_profile=neo` |
+| `neo-evidence` | here | the dispatcher supplied `neo-hardware-evidence` | the record's form (`scripts/hardware_evidence.py`), edge only, and `neo-image-run-id` |
+| `neo-upload` | `mac-upload.yml` | `neo-evidence` and `upload` succeeded | the record in place of VM evidence: its image and sha256, and IMAGE and `installer_data.json` built for the Neo alone; the earlier run must be a successful `main` run; the build attestation as for `upload` |
+| `neo` | here | always (unless cancelled) | hands the catalog the Neo inputs when every Neo job passed, otherwise warns in the run summary and hands it nothing |
+| `catalog` | `mac-catalog.yml` | real run, every M1, M2 and M3 job above succeeded | evidence re-checked for each payload's digest; each image's `installer_data.json` admits exactly the Macs it is given; every URL serves its pinned bytes; `catalog-release` (owner approval, main only) signs |
 
 A dry run uploads to a `dryrun-` scratch release and deletes it, and signs no catalog. A catalog dry run needs files the app can download, so run `mac-catalog.yml` by hand for that.
 
@@ -20,6 +25,18 @@ A dry run uploads to a `dryrun-` scratch release and deletes it, and signs no ca
 - `acceptance` uploads the artifact `acceptance-evidence`, holding `acceptance-evidence.json` ([format](mac-acceptance-evidence.md)), and outputs `result`, `evidence-artifact` and `evidence-run-id` (this run). It also keeps the harness's logs as `acceptance-harness-logs`. The pipeline's `runner` input (empty by default) overrides the VM job's runner.
 - `upload` downloads the image and evidence artifacts from this run. After a real upload it outputs `payload` and `installer-data` (the catalog's inputs, built from the files it uploaded and verified) and `evidence` (the record it checked).
 - `catalog-inputs` outputs the `engine` and `installer` blocks of `.github/mac-release-pipeline.json`.
+- `neo-build` outputs the Neo image's `name`, `payload` and `sha256` like `build`; the image artifact is named after the image, whose package set differs from the M1, M2 and M3 one, so the two never share an artifact, a release or an `evidenceRevision` (their zips share a file name, each under its own release). The Recovery app passes as the artifact `neo-native-recovery-input`.
+- `neo-evidence` outputs the record's `image`, `sha256` and the record itself; `neo-upload` outputs `payload`, `installer-data` and `evidence` like `upload`; `neo` passes them to `catalog` as `neo-image`, `neo-payload`, `neo-installer-data` and `neo-evidence`, or passes empty strings.
+
+## The MacBook Neo image
+
+The Neo boots its own image (`hardware_profiles` in `scripts/supported-models.json`): Aurora's J700 Stage 1 and Stage 2, the Aurora kernel and an `installer_data.json` that admits only `j700ap`. The M1, M2 and M3 image excludes `j700ap`. The VM harness cannot test it: `tools/acceptance/mac-image/run` (pinned in `mac-acceptance.yml`) boots QEMU's `virt` machine with a generic Arch Linux ARM kernel, the image's initramfs and a device tree whose root compatible is fixed to an M1 Pro (`apple,j314s`, `apple,t6000`). It never runs m1n1, Stage 1 or the Aurora kernel, cannot present a J700, and has no input that changes the board. A VM run of the Neo image would test its userland as an M1 Pro, which says nothing about a Neo. So the Neo image's gate is a recorded install on a real Neo instead, on edge only:
+
+1. Any pipeline run (an automatic one or a dry run) builds a Neo image, keeps it 14 days as a workflow artifact and names it, with its sha256 and the run id, in the run summary.
+2. A tester installs that exact zip on a MacBook Neo with app 2.3.0 or later and writes the hardware install record ([format](catalog-release.md#hardware-install-record)).
+3. The owner dispatches the pipeline by hand with `neo-hardware-evidence` (the record) and `neo-image-run-id` (that run). The run builds the M1, M2 and M3 image as usual, uploads the recorded Neo image from the earlier run with the record as its evidence, and the catalog offers it to the Neo alone. The owner reviews the record in the `catalog-release` approval.
+
+A Neo failure never holds back the M1, M2 and M3 image. When the Neo build, record check or upload fails, or `prepare` refuses the Neo image (its record, digest, board, app version or `installer_data.json`), the catalog is built and signed without it, and the run summary carries a warning. `edge-dispatch.yml` cannot supply a record, so an automatic run signs an edge catalog without the Neo; once Neo users depend on edge, the owner re-dispatches with a record after each automatic run. rc and stable never take the Neo image: promotion refuses a catalog with more than one image, and hardware evidence is refused off edge.
 
 ## Where the jobs run
 
@@ -36,4 +53,4 @@ The catalog takes the evidence record the upload checked, and the upload took it
 ## `.github/mac-release-pipeline.json`
 
 - `engine`: the catalog's engine block ([format](catalog-release.md#inputs)). It is the engine `Packaging/build-app.sh` pins, published as the `engine-v0.9.2-omarchy.28` release. Ticket 13 moves it to `mac.omarchy.org/v1/engine/`. A test keeps this block in step with `build-app.sh` and `Engine/source-lock.json`.
-- `installer`: the app compatibility block, `{"minimumVersion", "latestVersion", "downloadURL"}`. Until an app release from `mac-app-release.yml` is published, it is `null`, and on a real run `catalog-inputs` refuses with a message saying so, before the upload, so nothing is made public. Set it to that release's version and `.dmg` URL.
+- `installer`: the app compatibility block, `{"minimumVersion", "latestVersion", "downloadURL"}`. The edge catalog requires app 2.3.0, the first release whose edge catalog offers the Neo, and a catalog with the Neo image refuses anything older. Until `mac-app-release.yml` publishes 2.3.0 (push the tag `v2.3.0`), `downloadURL` is `null`, and on a real run `catalog-inputs` refuses with a message saying so, before the upload, so nothing is made public. Set it to that release's `.dmg` URL once it is published. `null` for the whole block means no app release at all, with the same refusal.

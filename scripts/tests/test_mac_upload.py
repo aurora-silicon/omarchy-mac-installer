@@ -220,6 +220,54 @@ class UploadTests(unittest.TestCase):
                                release=self.image, dry_run=False, evidence=self.evidence)
         self.assertEqual(destination.puts, [])
 
+    def neo_artifact(self) -> tuple[Path, str, str]:
+        artifact = self.directory / "neo-artifact"
+        image, sha256 = fixture.make(artifact, 2 * PART + 5, "neo", "neo")
+        return artifact, image, sha256
+
+    def publish_neo(self, artifact: Path, image: str, sha256: str, record: dict, *, dry_run: bool = False,
+                    evidence: Path | None = None) -> tuple[RecordingDestination, dict]:
+        destination = RecordingDestination(self.published, image, PART)
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = upload.publish(artifact=artifact, image=image, sha256=sha256, destination=destination,
+                                    release=image, dry_run=dry_run, evidence=evidence, evidence_run_url=RUN_URL,
+                                    hardware_evidence=self.write_evidence(record, "hardware.json"))
+        return destination, report
+
+    def test_a_neo_image_uploads_with_its_hardware_install_record(self):
+        artifact, image, sha256 = self.neo_artifact()
+        destination, report = self.publish_neo(artifact, image, sha256, fixture.hardware_evidence(image, sha256))
+        self.assertIn(upload.HARDWARE_EVIDENCE_NAME, destination.puts)
+        self.assertNotIn(upload.EVIDENCE_NAME, destination.puts)
+        self.assertEqual(report["evidence"], {"result": "pass", "kind": "hardware-install", "board": "apple,j700",
+                                              "installer_version": "2.3.0", "tester": "fixture tester"})
+        published = json.loads((self.published / image / upload.HARDWARE_EVIDENCE_NAME).read_text())
+        self.assertEqual(published["image_sha256"], sha256)
+
+    def test_a_hardware_install_record_must_fit_the_image(self):
+        artifact, image, sha256 = self.neo_artifact()
+        cases = {
+            "not " + sha256: fixture.hardware_evidence(image, "e" * 64),
+            "did not pass": fixture.hardware_evidence(image, sha256, result="fail"),
+            "only for a Mac with its own image": fixture.hardware_evidence(image, sha256, board="apple,j413"),
+            "must name its tester": fixture.hardware_evidence(image, sha256, tester=" "),
+            "has no installer_version": {k: v for k, v in fixture.hardware_evidence(image, sha256).items()
+                                         if k != "installer_version"},
+            "is for image": fixture.hardware_evidence(self.image, sha256),
+        }
+        for message, record in cases.items():
+            with self.subTest(message):
+                self.assertRefused(message, self.publish_neo, artifact, image, sha256, record)
+                self.assertFalse((self.published / image).exists())
+        # The M1, M2 and M3 image passes VM acceptance; a hand install never stands in for it.
+        self.assertRefused("not built with apple,j700's hardware profile", self.publish_neo, self.artifact,
+                           self.image, self.sha256, fixture.hardware_evidence(self.image, self.sha256))
+        (artifact / "installer_data.json").write_text(json.dumps(fixture.installer_data("legacy")))
+        self.assertRefused("admits apple,j274", self.publish_neo, artifact, image, sha256,
+                           fixture.hardware_evidence(image, sha256))
+        self.assertRefused("not both", self.publish_neo, artifact, image, sha256,
+                           fixture.hardware_evidence(image, sha256), evidence=self.evidence)
+
     def test_evidence_that_is_not_json_is_refused(self):
         evidence = self.directory / "broken.json"
         evidence.write_text("{")
@@ -354,8 +402,10 @@ class CatalogInputTests(unittest.TestCase):
         catalog = load("catalog_release", SCRIPTS / "catalog_release.py")
         engine = json.loads((SCRIPTS.parent / ".github" / "mac-release-pipeline.json").read_text())["engine"]
         installer = {"minimumVersion": "2.1.0", "latestVersion": "2.1.0", "downloadURL": self.BASE.format("v2.1.0") + "app.dmg"}
-        document = catalog.build_catalog("edge", self.image, payload, engine, inputs["installer_data"],
-                                         fixture.evidence(self.sha256, RUN_URL), installer,
+        image = catalog.check_image("edge", self.image, payload, inputs["installer_data"],
+                                    (self.artifact / "installer_data.json").read_bytes(), "legacy",
+                                    fixture.evidence(self.sha256, RUN_URL), installer)
+        document = catalog.build_catalog("edge", [image], engine, installer,
                                          catalog.datetime.datetime(2026, 10, 14, tzinfo=catalog.datetime.timezone.utc))
         self.assertIn(self.sha256, json.dumps(document))
 

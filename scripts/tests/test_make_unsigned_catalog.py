@@ -30,6 +30,8 @@ class CatalogGeneratorTests(unittest.TestCase):
         self.assets = self.directory / "assets"
         self.assets.mkdir()
         self.inputs = json.loads(TEMPLATE.read_text())
+        # The committed template waits for the 2.3.0 app release's URL.
+        self.inputs["installer"]["download_url"] = "https://downloads.example.test/installer/app.dmg"
         for key in ("engine_name", "metadata_name", "payload_name"):
             (self.assets / self.inputs[key]).write_bytes(key.encode() * 64)
 
@@ -217,15 +219,18 @@ class CatalogGeneratorTests(unittest.TestCase):
 
     def test_the_manifest_is_every_m1_m2_and_m3_mac(self) -> None:
         manifest = json.loads(MANIFEST.read_text())
-        self.assertEqual(len(manifest["supported"]), 34)
+        self.assertEqual(len(manifest["supported"]), 35)
         self.assertTrue(set(M3_MACS) <= set(manifest["supported"]))
         self.assertEqual(set(manifest["refused"]), {"apple,j575d", "apple,j614s"})
-        self.assertEqual(set(manifest["developer"]), {"apple,j700"})
+        self.assertEqual(manifest["developer"], {})
+        # The MacBook Neo is supported with its own image, and untested.
+        self.assertEqual(manifest["hardware_profiles"], {"apple,j700": "neo"})
+        self.assertIn("apple,j700", manifest["untested"])
+        legacy = [m for m in manifest["supported"] if m not in manifest["hardware_profiles"]]
+        self.assertEqual(len(legacy), 34)
         for template in sorted(MANIFEST.parent.glob("release-inputs*.template.json")):
             identifiers = json.loads(template.read_text())["device_identifiers"]
-            self.assertEqual(
-                sorted(identifiers), sorted(manifest["supported"]), template.name
-            )
+            self.assertEqual(sorted(identifiers), sorted(legacy), template.name)
 
     def test_the_generated_catalog_enables_every_supported_mac(self) -> None:
         result = self.generate()
@@ -258,6 +263,16 @@ class CatalogGeneratorTests(unittest.TestCase):
         document = json.loads(json.dumps(self.inputs))
         document["downstream_revision"] = "abc123"
         self.assertRejected(document, "40-character hex")
+
+    def test_the_committed_templates_wait_for_the_2_3_0_app_release(self) -> None:
+        for template in sorted(TEMPLATE.parent.glob("release-inputs*.template.json")):
+            with self.subTest(template.name):
+                document = json.loads(template.read_text())
+                self.assertEqual(
+                    document["installer"],
+                    {"minimum_version": "2.3.0", "latest_version": "2.3.0", "download_url": None},
+                )
+                self.assertRejected(document, "app 2.3.0 is not released yet")
 
     def test_the_committed_template_is_valid(self) -> None:
         result = self.generate()
@@ -341,9 +356,8 @@ class CatalogGeneratorTests(unittest.TestCase):
         document["device_identifiers"].remove("apple,j613")
         self.assertRejected(document, "missing apple,j613", developer=True)
 
-    def test_a_developer_catalog_never_passes_the_channel_check(self) -> None:
-        self.generate(self.with_neo(), developer=True)
-        check = subprocess.run(
+    def check_catalog(self) -> subprocess.CompletedProcess:
+        return subprocess.run(
             [
                 sys.executable,
                 str(SCRIPT.with_name("supported_models.py")),
@@ -353,8 +367,28 @@ class CatalogGeneratorTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def test_the_channel_check_takes_the_neo_only_on_its_own_payload(self) -> None:
+        self.assertEqual(self.generate(self.with_neo(), developer=True).returncode, 0)
+        check = self.check_catalog()
+        self.assertEqual(check.returncode, 0, check.stderr)
+        catalog = json.loads((self.directory / "catalog.json").read_text())
+        main = catalog["models"][0]
+        for model in catalog["models"]:
+            if model["deviceIdentifier"] == "apple,j700":
+                model["payloadDigest"] = main["payloadDigest"]
+        (self.directory / "catalog.json").write_text(json.dumps(catalog))
+        check = self.check_catalog()
         self.assertNotEqual(check.returncode, 0)
-        self.assertIn("apple,j700 is not in scripts/supported-models.json", check.stderr)
+        self.assertIn("each hardware profile needs its own image", check.stderr)
+
+    def test_the_neo_never_shares_the_main_payload(self) -> None:
+        document = json.loads(json.dumps(self.inputs))
+        document["device_identifiers"].append("apple,j700")
+        self.assertRejected(document, "each hardware profile needs its own image")
+        document = self.with_neo()
+        document["developer_models"][0]["payload_name"] = self.inputs["payload_name"]
+        self.assertRejected(document, "each hardware profile needs its own image", developer=True)
 
 
 if __name__ == "__main__":

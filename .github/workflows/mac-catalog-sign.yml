@@ -3,8 +3,9 @@ name: Mac catalog sign
 # The one place the Omacom catalog key is used. Both catalog writers call it
 # after building an unsigned catalog in their own no-secret job:
 #
-#   mac-catalog.yml  a new edge catalog for an image with passing VM evidence
-#                    (gate: evidence)
+#   mac-catalog.yml  a new edge catalog for an image with passing VM evidence,
+#                    and the MacBook Neo's image with its hardware install
+#                    record when the catalog carries it (gate: evidence)
 #   mac-promote.yml  an rc or stable catalog re-signing a published catalog's
 #                    exact pins (gate: promotion; parked)
 #
@@ -19,8 +20,10 @@ name: Mac catalog sign
 #            reads it back
 #
 # The caller uploads the artifact catalog-unsigned holding `channel`,
-# catalog-<channel>.json and its gate's inputs (evidence.json, or
-# source-channel and source.signed.json), calls with `secrets: inherit` and
+# catalog-<channel>.json and its gate's inputs (evidence.json, neo-evidence.json
+# when the catalog carries the Neo image and installer-data/<sha256>.json for
+# each image, or source-channel and source.signed.json), calls with
+# `secrets: inherit` and
 # grants contents: write. Only this repository's workflows may call it.
 
 on:
@@ -99,7 +102,12 @@ jobs:
           # promotion writes rc or stable (both commands refuse others too).
           case "$GATE:$CHANNEL" in
             evidence:edge)
-              python3 scripts/catalog_release.py check-evidence --catalog "$catalog" --evidence "$inputs/evidence.json"
+              # Each payload against its own evidence and the Macs its
+              # installer_data.json admits.
+              neo=()
+              [[ ! -f $inputs/neo-evidence.json ]] || neo=(--neo-evidence "$inputs/neo-evidence.json")
+              python3 scripts/catalog_release.py check-evidence --catalog "$catalog" --evidence "$inputs/evidence.json" \
+                "${neo[@]}" --installer-data-dir "$inputs/installer-data"
               ;;
             promotion:rc | promotion:stable)
               python3 scripts/catalog_release.py check-promotion --channel "$CHANNEL" \

@@ -26,6 +26,25 @@ name: Mac release pipeline
 #               and signs in catalog-release, which waits for the owner's
 #               approval: the pipeline's only manual step.
 #
+# Beside them, the MacBook Neo's own image, which never holds back the M1, M2
+# and M3 one:
+#
+#   neo-recovery  the native Recovery app the Neo image carries, built on
+#               macOS as neo-image.yml builds it
+#   neo-build   mac-image.yml again with hardware-profile neo: a Neo image for
+#               a tester to install. The VM harness cannot boot it (it runs a
+#               generic kernel under an M1 Pro identity, nothing a Neo boots
+#               with), so it has no acceptance job
+#   neo-evidence  only when the dispatcher supplies neo-hardware-evidence: the
+#               record of a Neo image, built by an earlier run
+#               (neo-image-run-id), installed on a real MacBook Neo
+#               (scripts/hardware_evidence.py)
+#   neo-upload  mac-upload.yml for that earlier image, gated by the record in
+#               place of VM evidence
+#   neo         always: hands the catalog the Neo inputs when every Neo step
+#               passed, and otherwise says in the run summary why the catalog
+#               offers the M1, M2 and M3 image alone
+#
 # Data passes as job outputs (image name, sha256, evidence artifact and run,
 # catalog inputs) and as artifacts of this run (the image, the evidence
 # record), which the called workflows read by name. Every gate stays in the called workflow it
@@ -41,7 +60,9 @@ name: Mac release pipeline
 #
 # Started by edge-dispatch.yml (gh workflow run, dry-run=false) when an edge
 # publish changes a package the image installs, or by hand (dry run by
-# default). Never for pull requests.
+# default). Never for pull requests. Only a hand dispatch can supply the Neo's
+# hardware evidence, so an edge-dispatch run offers the M1, M2 and M3 image
+# alone.
 
 on:
   workflow_dispatch:
@@ -52,6 +73,14 @@ on:
         default: true
       runner:
         description: The VM acceptance job's runs-on as JSON; empty for mac-acceptance.yml's default (Namespace's Apple-backed Linux ARM64 runner)
+        type: string
+        default: ''
+      neo-hardware-evidence:
+        description: Edge only, optional - the hardware install record (JSON) of a Neo image an earlier run built
+        type: string
+        default: ''
+      neo-image-run-id:
+        description: The run that built the Neo image the hardware evidence names
         type: string
         default: ''
 
@@ -140,10 +169,16 @@ jobs:
           set -euo pipefail
           config=${PIPELINE_CONFIG:-.github/mac-release-pipeline.json}
           # Before the upload, so a real run without an app release publishes
-          # nothing. A dry run signs no catalog and only notes it.
-          if [[ $(jq -r '.installer | type' "$config") != object && $DRY_RUN == true ]]; then
-            echo "::notice::$config names no app release yet; a real run would stop here"
-          elif [[ $(jq -r '.installer | type' "$config") != object ]]; then
+          # nothing. A dry run signs no catalog and only notes it. A block
+          # whose downloadURL is null names an app version not released yet.
+          released=$(jq -r 'if (.installer | type) != "object" then "none"
+            elif .installer.downloadURL == null then "pending" else "yes" end' "$config")
+          if [[ $released != yes && $DRY_RUN == true ]]; then
+            echo "::notice::$config names no published app release yet ($released); a real run would stop here"
+          elif [[ $released == pending ]]; then
+            echo "::error::$config requires app $(jq -r .installer.minimumVersion "$config"), which is not released yet; set installer.downloadURL to its published .dmg (mac-app-release.yml) before a catalog can be signed"
+            exit 1
+          elif [[ $released != yes ]]; then
             echo "::error::$config names no app release (installer); set it to a published app release (mac-app-release.yml) before a catalog can be signed"
             exit 1
           fi
@@ -156,7 +191,7 @@ jobs:
           config = json.load(open(sys.argv[1]))
           try:
               release.check_engine(config["engine"])
-              if config["installer"] is not None:
+              if config["installer"] is not None and config["installer"].get("downloadURL") is not None:
                   release.check_installer(config["installer"], config["engine"]["version"])
           except (release.Refusal, KeyError, TypeError) as error:
               sys.exit(f"::error::{sys.argv[1]}: {error}")
@@ -181,10 +216,167 @@ jobs:
       evidence-run-id: ${{ needs.acceptance.outputs.evidence-run-id }}
       make-public: ${{ !inputs.dry-run }}
 
+  neo-recovery:
+    name: Neo Recovery app
+    needs: plan
+    runs-on: macos-26
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Build and record the Recovery source and native tools
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/neo-recovery"
+          {
+            git rev-parse HEAD
+            git rev-parse HEAD:Recovery
+            sw_vers
+            xcodebuild -version
+            xcrun swift --version
+          } >"$RUNNER_TEMP/neo-recovery/source.txt"
+          bash Recovery/build-recovery.sh "$RUNNER_TEMP/neo-recovery/template"
+          source Packaging/identity.conf
+          tar -cf "$RUNNER_TEMP/neo-recovery/native-recovery.tar" -C "$RUNNER_TEMP/neo-recovery/template" "$INSTALLER_RECOVERY_APP_NAME.app" omarchy-recovery-app.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: neo-native-recovery-input
+          path: |
+            ${{ runner.temp }}/neo-recovery/native-recovery.tar
+            ${{ runner.temp }}/neo-recovery/source.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  neo-build:
+    name: Neo build
+    needs: neo-recovery
+    uses: ./.github/workflows/mac-image.yml
+    permissions:
+      contents: read
+      id-token: write # the image's build attestation
+      attestations: write
+    with:
+      hardware-profile: neo
+      recovery-app-artifact: neo-native-recovery-input
+
+  neo-evidence:
+    name: Neo hardware evidence
+    needs: plan
+    if: inputs.neo-hardware-evidence != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.check.outputs.image }}
+      sha256: ${{ steps.check.outputs.sha256 }}
+      evidence: ${{ steps.check.outputs.evidence }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Check the hardware install record
+        id: check
+        env:
+          EVIDENCE: ${{ inputs.neo-hardware-evidence }}
+          IMAGE_RUN_ID: ${{ inputs.neo-image-run-id }}
+        run: |
+          set -euo pipefail
+          if [[ ! $IMAGE_RUN_ID =~ ^[1-9][0-9]{0,19}$ ]]; then
+            echo "::error::neo-image-run-id must name the run that built the Neo image the record is for"
+            exit 1
+          fi
+          record=$RUNNER_TEMP/hardware-evidence.json
+          printf '%s\n' "$EVIDENCE" >"$record"
+          python3 -I scripts/hardware_evidence.py describe "$record" | tee -a "$GITHUB_OUTPUT"
+          echo "evidence=$(jq -c . "$record")" >>"$GITHUB_OUTPUT"
+
+  neo-upload:
+    name: Neo upload
+    needs: [neo-evidence, upload]
+    uses: ./.github/workflows/mac-upload.yml
+    permissions:
+      contents: write # the image's release
+      actions: read # the earlier run's image artifact
+      attestations: read # the image's build attestation
+    with:
+      image-artifact: ${{ needs.neo-evidence.outputs.image }}
+      image-sha256: ${{ needs.neo-evidence.outputs.sha256 }}
+      image-run-id: ${{ inputs.neo-image-run-id }}
+      dry-run: ${{ inputs.dry-run }}
+      hardware-evidence: ${{ needs.neo-evidence.outputs.evidence }}
+      make-public: ${{ !inputs.dry-run }}
+
+  neo:
+    name: Neo for the catalog
+    needs: [neo-build, neo-evidence, neo-upload]
+    # Even after a Neo failure, which only leaves the Neo out of the catalog.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      image: ${{ steps.pick.outputs.image }}
+      payload: ${{ steps.pick.outputs.payload }}
+      installer-data: ${{ steps.pick.outputs.installer-data }}
+      evidence: ${{ steps.pick.outputs.evidence }}
+    steps:
+      - name: Offer the Neo image or say why not
+        id: pick
+        env:
+          BUILD: ${{ needs.neo-build.result }}
+          BUILT: ${{ needs.neo-build.outputs.name }}
+          BUILT_SHA256: ${{ needs.neo-build.outputs.sha256 }}
+          EVIDENCE_GIVEN: ${{ inputs.neo-hardware-evidence != '' }}
+          EVIDENCE: ${{ needs.neo-evidence.result }}
+          UPLOAD: ${{ needs.neo-upload.result }}
+          IMAGE: ${{ needs.neo-evidence.outputs.image }}
+          PAYLOAD: ${{ needs.neo-upload.outputs.payload }}
+          INSTALLER_DATA: ${{ needs.neo-upload.outputs.installer-data }}
+          RECORD: ${{ needs.neo-upload.outputs.evidence }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          summary() { printf '%s\n' "$@" >>"$GITHUB_STEP_SUMMARY"; }
+          summary "### MacBook Neo"
+          if [[ $BUILD == success ]]; then
+            summary "This run built the Neo image \`$BUILT\` (sha256 \`$BUILT_SHA256\`, run $GITHUB_RUN_ID)." \
+              "To offer it, install it on a MacBook Neo and dispatch this pipeline with its hardware install record" \
+              "(neo-hardware-evidence) and neo-image-run-id=$GITHUB_RUN_ID within 14 days."
+          else
+            echo "::warning::the Neo image did not build in this run ($BUILD); the M1, M2 and M3 image is not affected"
+            summary "> **Warning:** the Neo image did not build in this run ($BUILD)."
+          fi
+          if [[ $EVIDENCE_GIVEN != true ]]; then
+            summary "No Neo hardware evidence was supplied: the catalog offers the M1, M2 and M3 image alone."
+          elif [[ $EVIDENCE == success && $UPLOAD == success && ($DRY_RUN == true || -n $PAYLOAD) ]]; then
+            summary "The Neo image \`$IMAGE\` has its hardware install record and is uploaded; the catalog offers it."
+            if [[ $DRY_RUN != true ]]; then
+              {
+                echo "image=$IMAGE"
+                echo "payload=$PAYLOAD"
+                echo "installer-data=$INSTALLER_DATA"
+                echo "evidence=$RECORD"
+              } >>"$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::the Neo image is left out (hardware evidence $EVIDENCE, upload $UPLOAD); the catalog offers the M1, M2 and M3 image alone"
+            summary "> **Warning:** the Neo image is left out (hardware evidence $EVIDENCE, upload $UPLOAD); the catalog offers the M1, M2 and M3 image alone."
+          fi
+
   catalog:
     name: Catalog
-    needs: [build, acceptance, upload, catalog-inputs]
-    if: needs.acceptance.outputs.result == 'pass' && !inputs.dry-run
+    needs: [build, acceptance, upload, catalog-inputs, neo]
+    # The Neo steps may fail; every M1, M2 and M3 one must have passed.
+    if: >-
+      !cancelled() && needs.build.result == 'success' && needs.acceptance.result == 'success' &&
+      needs.acceptance.outputs.result == 'pass' && needs.catalog-inputs.result == 'success' &&
+      needs.upload.result == 'success' && needs.neo.result == 'success' && !inputs.dry-run
     uses: ./.github/workflows/mac-catalog.yml
     permissions:
       contents: write # the catalog-edge release
@@ -195,6 +387,10 @@ jobs:
       evidence: ${{ needs.upload.outputs.evidence }}
       engine: ${{ needs.catalog-inputs.outputs.engine }}
       installer: ${{ needs.catalog-inputs.outputs.installer }}
+      neo-image: ${{ needs.neo.outputs.image }}
+      neo-payload: ${{ needs.neo.outputs.payload }}
+      neo-installer-data: ${{ needs.neo.outputs.installer-data }}
+      neo-evidence: ${{ needs.neo.outputs.evidence }}
       channel: edge
       dry-run: false
     secrets:

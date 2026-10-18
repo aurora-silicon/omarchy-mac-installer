@@ -204,7 +204,8 @@ sign_catalog() {
   shasum -a 256 "$1" | cut -d' ' -f1 | tr -d '\n' >"$2"
 }
 
-# Every supported Mac, as a real catalog lists them.
+# Every M1, M2 and M3 Mac, as a real one-image catalog lists them (the Neo
+# boots its own image).
 write_catalog() {
   local output=$1 sequence=$2 payload_url=$3 payload_size=$4
   python3 - "$output" "$sequence" "$payload_url" "$payload_size" "$ROOT/scripts/supported-models.json" <<'PY'
@@ -212,6 +213,7 @@ import json
 import sys
 
 output, sequence, payload_url, payload_size, manifest = sys.argv[1:6]
+manifest = json.load(open(manifest))
 catalog = {
     "schemaVersion": 4,
     "sequence": int(sequence),
@@ -226,7 +228,8 @@ catalog = {
                 "sizeBytes": int(payload_size),
             },
         }
-        for identifier in json.load(open(manifest))["supported"]
+        for identifier in manifest["supported"]
+        if identifier not in manifest.get("hardware_profiles", {})
     ],
 }
 with open(output, "w", encoding="utf-8") as stream:

@@ -66,8 +66,21 @@ def artifact(tag: str, name: str, data: bytes) -> dict:
 PAYLOAD_PARTS = [b"payload-part-zero" * 50, b"payload-part-one" * 40]
 PAYLOAD = b"".join(PAYLOAD_PARTS)
 ENGINE = b"engine-tarball" * 30
-METADATA = b'{"os_list": []}\n'
 ZIP = f"{IMAGE}.zip"
+
+
+def installer_data(allowed: list[str] | None, excluded: list[str]) -> bytes:
+    return json.dumps({"os_list": [{"omarchy_target": "apple-silicon-full-os", "allowed_device_classes": allowed,
+                                    "excluded_device_classes": excluded}]}).encode() + b"\n"
+
+
+# The image builder's board restrictions: the legacy image refuses the Neo,
+# the Neo image admits only the Neo.
+METADATA = installer_data(None, ["j700ap"])
+NEO_IMAGE = "omarchy-mac-edge-2026.10.14-fedcba987654"
+NEO_PAYLOAD = b"neo-payload" * 70
+NEO_METADATA = installer_data(["j700ap"], [])
+NEO_ZIP = f"{NEO_IMAGE}.zip"
 
 
 def payload_document() -> dict:
@@ -86,9 +99,22 @@ def engine_document() -> dict:
     )
 
 
-def installer_document() -> dict:
-    return {"minimumVersion": "2.1.0", "latestVersion": "2.1.0",
-            "downloadURL": f"{release_base('app-v2.1.0')}/Omarchy-Installer.dmg"}
+def installer_document(version: str = "2.1.0") -> dict:
+    return {"minimumVersion": version, "latestVersion": version,
+            "downloadURL": f"{release_base(f'app-v{version}')}/Omarchy-Installer.dmg"}
+
+
+def neo_documents() -> dict:
+    """The Neo image's catalog inputs, as the pipeline passes them."""
+    return {"payload": artifact(NEO_IMAGE, NEO_ZIP, NEO_PAYLOAD),
+            "installer_data": artifact(NEO_IMAGE, "installer_data.json", NEO_METADATA),
+            "evidence": hardware_document()}
+
+
+def hardware_document(**changes) -> dict:
+    return {"kind": "hardware-install", "image": NEO_IMAGE, "image_sha256": sha(NEO_PAYLOAD),
+            "board": "apple,j700", "installer_version": "2.3.0", "tester": "Owner on the lab Neo",
+            "result": "pass", **changes}
 
 
 def evidence_document(image_sha256: str = sha(PAYLOAD)) -> dict:
@@ -148,19 +174,48 @@ class ReleaseTestCase(unittest.TestCase):
             capture_output=True, text=True, env=environment or self.environment,
         )
 
+    def installer_data_dir(self, *documents: bytes) -> Path:
+        directory = self.directory / "installer-data"
+        directory.mkdir(exist_ok=True)
+        for document in documents or (METADATA, NEO_METADATA):
+            (directory / f"{sha(document)}.json").write_bytes(document)
+        return directory
+
     def prepare(self, evidence: object = "default", payload: dict | None = None, out: str = "out",
-                *extra: str) -> subprocess.CompletedProcess:
+                *extra: str, neo: dict | None = None, installer: dict | None = None) -> subprocess.CompletedProcess:
         arguments = [
             "prepare", "--channel", "edge", "--image", IMAGE,
             "--payload", str(self.write("payload.json", payload or payload_document())),
             "--engine", str(self.write("engine.json", engine_document())),
             "--installer-data", str(self.write("metadata.json", artifact(IMAGE, "installer_data.json", METADATA))),
-            "--installer", str(self.write("installer.json", installer_document())),
+            "--installer", str(self.write("installer.json", installer or installer_document())),
+            "--installer-data-dir", str(self.installer_data_dir()),
             "--now", NOW, "--out", str(self.directory / out), *extra,
         ]
         if evidence is not None:
             document = evidence_document() if evidence == "default" else evidence
             arguments += ["--evidence", str(self.write("evidence.json", document))]
+        if neo is not None:
+            arguments += ["--neo-image", neo.get("image", NEO_IMAGE),
+                          "--neo-payload", str(self.write("neo-payload.json", neo["payload"])),
+                          "--neo-installer-data", str(self.write("neo-metadata.json", neo["installer_data"]))]
+            if neo.get("evidence") is not None:
+                arguments += ["--neo-evidence", str(self.write("neo-evidence.json", neo["evidence"]))]
+        return self.run_tool(*arguments)
+
+    def prepare_with_neo(self, out: str = "out", **changes) -> subprocess.CompletedProcess:
+        return self.prepare("default", None, out, neo={**neo_documents(), **changes},
+                            installer=installer_document("2.3.0"))
+
+    def check_evidence(self, catalog: Path, evidence: object = "default", neo_evidence: object = None,
+                       installer_data: Path | None = None) -> subprocess.CompletedProcess:
+        arguments = ["check-evidence", "--catalog", str(catalog),
+                     "--installer-data-dir", str(installer_data or catalog.parent / "installer-data")]
+        if evidence is not None:
+            arguments += ["--evidence", str(self.write("e.json", evidence_document() if evidence == "default"
+                                                       else evidence))]
+        if neo_evidence is not None:
+            arguments += ["--neo-evidence", str(self.write("ne.json", neo_evidence))]
         return self.run_tool(*arguments)
 
     def sign(self, catalog: Path, key: str | None = None, trust_root: Path | None = None,
@@ -196,9 +251,11 @@ class CatalogReleaseTests(ReleaseTestCase):
     def test_round_trip_enables_every_mac_and_pins_the_digests(self) -> None:
         catalog_path = self.built_catalog()
         catalog = json.loads(catalog_path.read_text())
-        supported, _ = release.supported_models.load()
         untested = release.supported_models.untested()
-        self.assertEqual([model["deviceIdentifier"] for model in catalog["models"]], supported)
+        # Without the Neo's own image: every M1, M2 and M3 Mac.
+        self.assertEqual([model["deviceIdentifier"] for model in catalog["models"]],
+                         release.supported_models.required())
+        self.assertEqual(len(catalog["models"]), 34)
         self.assertEqual(catalog["schemaVersion"], 4)
         self.assertEqual(catalog["sequence"], SEQUENCE)
         self.assertNotIn("expiresAt", catalog)
@@ -246,10 +303,14 @@ class CatalogReleaseTests(ReleaseTestCase):
         result = self.run_tool("verify-envelope", "--envelope", str(envelope), "--trust-root", str(self.trust_root))
         self.assert_refused(result, "does not verify")
 
-    def test_the_app_fixture_verifies_and_covers_every_mac(self) -> None:
-        trust_root = (FIXTURE / "trust-root.ed25519.pub").read_bytes()
-        document = release.verify_envelope((FIXTURE / "catalog-edge.signed.json").read_bytes(), trust_root, OPENSSL)
-        self.assertEqual(release.supported_models.catalog_errors(document), [])
+    def test_the_app_fixtures_verify_and_cover_every_mac(self) -> None:
+        for fixture, images in ((FIXTURE, 1), (FIXTURE.with_name("ci-signed-catalog-neo"), 2)):
+            with self.subTest(fixture.name):
+                trust_root = (fixture / "trust-root.ed25519.pub").read_bytes()
+                document = release.verify_envelope((fixture / "catalog-edge.signed.json").read_bytes(), trust_root,
+                                                   OPENSSL)
+                self.assertEqual(release.supported_models.catalog_errors(document), [])
+                self.assertEqual(len(release.catalog_images(document)), images)
 
     # ── the evidence gate ────────────────────────────────────────────────────
 
@@ -282,18 +343,137 @@ class CatalogReleaseTests(ReleaseTestCase):
 
     def test_the_signing_job_rechecks_the_evidence(self) -> None:
         catalog = self.built_catalog()
-        ok = self.run_tool("check-evidence", "--catalog", str(catalog),
-                           "--evidence", str(self.write("e.json", evidence_document())))
+        self.assertEqual(sorted(path.name for path in (catalog.parent / "installer-data").iterdir()),
+                         [f"{sha(METADATA)}.json"])
+        ok = self.check_evidence(catalog)
         self.assertEqual(ok.returncode, 0, ok.stderr)
-        other = self.run_tool("check-evidence", "--catalog", str(catalog),
-                              "--evidence", str(self.write("e.json", evidence_document("e" * 64))))
-        self.assert_refused(other, "not " + sha(PAYLOAD))
-        self.assert_refused(self.run_tool("check-evidence", "--catalog", str(catalog)), "no VM evidence")
+        self.assertIn(f"evidence=passed {sha(PAYLOAD)} (legacy, 34 Macs)", ok.stdout)
+        self.assert_refused(self.check_evidence(catalog, evidence_document("e" * 64)), "not " + sha(PAYLOAD))
+        self.assert_refused(self.check_evidence(catalog, None), "no VM evidence")
         renamed = self.directory / "catalog-rc.json"
         shutil.copyfile(catalog, renamed)
-        self.assert_refused(self.run_tool("check-evidence", "--catalog", str(renamed),
-                                          "--evidence", str(self.write("e.json", evidence_document()))),
+        self.assert_refused(self.check_evidence(renamed, installer_data=catalog.parent / "installer-data"),
                             "rc and stable come from promotion")
+        (catalog.parent / "installer-data" / f"{sha(METADATA)}.json").write_bytes(METADATA + b" ")
+        self.assert_refused(self.check_evidence(catalog), "is not the installer_data.json the catalog pins")
+
+    # ── the MacBook Neo's own image ──────────────────────────────────────────
+
+    def test_a_neo_image_with_hardware_evidence_gets_only_the_neo(self) -> None:
+        result = self.prepare_with_neo()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"neo=included {NEO_IMAGE} {sha(NEO_PAYLOAD)}", result.stdout)
+        catalog_path = self.directory / "out" / "catalog-edge.json"
+        catalog = json.loads(catalog_path.read_text())
+        supported, _ = release.supported_models.load()
+        self.assertEqual([model["deviceIdentifier"] for model in catalog["models"]], supported)
+        by_board = {model["deviceIdentifier"]: model for model in catalog["models"]}
+        neo = by_board.pop("apple,j700")
+        self.assertEqual(neo["payloadDigest"], f"sha256:{sha(NEO_PAYLOAD)}")
+        self.assertEqual(neo["metadataDigest"], f"sha256:{sha(NEO_METADATA)}")
+        self.assertEqual(neo["evidenceRevision"], NEO_IMAGE)
+        self.assertEqual(neo["payloadArtifact"]["sourceURL"], f"{release_base(NEO_IMAGE)}/{NEO_ZIP}")
+        self.assertIn("previewNote", neo)
+        self.assertEqual(len(by_board), 34)
+        for model in by_board.values():
+            self.assertEqual((model["payloadDigest"], model["evidenceRevision"]), (f"sha256:{sha(PAYLOAD)}", IMAGE))
+            self.assertEqual(model["engineArtifact"], neo["engineArtifact"])
+        self.assertEqual(catalog["installer"]["minimumVersion"], "2.3.0")
+        self.assertEqual(sorted(path.name for path in (catalog_path.parent / "installer-data").iterdir()),
+                         sorted([f"{sha(METADATA)}.json", f"{sha(NEO_METADATA)}.json"]))
+
+        checked = self.check_evidence(catalog_path, neo_evidence=hardware_document())
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn(f"evidence=passed {sha(NEO_PAYLOAD)} (neo, 1 Macs)", checked.stdout)
+        self.assert_refused(self.check_evidence(catalog_path), "no hardware evidence record")
+        self.assert_refused(self.check_evidence(catalog_path, neo_evidence=hardware_document(image_sha256="d" * 64)),
+                            f"not {sha(NEO_PAYLOAD)}")
+        self.assert_refused(self.check_evidence(catalog_path, neo_evidence=hardware_document(result="fail")),
+                            "did not pass")
+        self.assertEqual(self.sign(catalog_path).returncode, 0)
+
+    def test_a_neo_image_that_fails_a_check_leaves_the_m1_m2_m3_catalog(self) -> None:
+        cases = {
+            "no hardware evidence record": dict(evidence=None),
+            f"not {sha(NEO_PAYLOAD)}": dict(evidence=hardware_document(image_sha256="d" * 64)),
+            "did not pass": dict(evidence=hardware_document(result="fail")),
+            "not 'apple,j314s'": dict(evidence=hardware_document(board="apple,j314s")),
+            "unknown keys": dict(evidence=hardware_document(signed_off=True)),
+            "older than the catalog's": dict(evidence=hardware_document(installer_version="2.2.0")),
+            "it also admits apple,j274": dict(installer_data=artifact(NEO_IMAGE, "installer_data.json", METADATA)),
+            "is the M1, M2 and M3 image": dict(image=IMAGE, evidence=hardware_document(image=IMAGE)),
+        }
+        for reason, change in cases.items():
+            with self.subTest(reason):
+                if "installer_data" in change:
+                    self.installer_data_dir(METADATA, NEO_METADATA)
+                result = self.prepare_with_neo(out=f"out-{len(reason)}", **change)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("neo=dropped: ", result.stdout)
+                self.assertIn(reason, result.stdout)
+                self.assertIn("warning: the Neo image is left out of the catalog", result.stderr)
+                catalog_path = self.directory / f"out-{len(reason)}" / "catalog-edge.json"
+                catalog = json.loads(catalog_path.read_text())
+                self.assertNotIn("apple,j700", [model["deviceIdentifier"] for model in catalog["models"]])
+                self.assertEqual(len(catalog["models"]), 34)
+                self.assertEqual(self.check_evidence(catalog_path).returncode, 0)
+        # An app too old for two images drops the Neo, never the M1, M2 and M3 catalog.
+        result = self.prepare("default", None, "old-app", neo=neo_documents())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("needs installer.minimumVersion >= 2.3.0", result.stdout)
+
+    def test_the_legacy_image_still_fails_closed_beside_a_neo_image(self) -> None:
+        result = self.prepare(evidence_document("f" * 64), None, "out", neo=neo_documents(),
+                              installer=installer_document("2.3.0"))
+        self.assert_refused(result, "not " + sha(PAYLOAD))
+        self.assertFalse((self.directory / "out").exists())
+
+    def test_the_signing_job_refuses_a_board_payload_mapping_the_images_do_not_admit(self) -> None:
+        self.assertEqual(self.prepare_with_neo().returncode, 0)
+        catalog_path = self.directory / "out" / "catalog-edge.json"
+        original = json.loads(catalog_path.read_text())
+
+        def check(document: dict) -> subprocess.CompletedProcess:
+            path = self.directory / "tampered" / "catalog-edge.json"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(document))
+            return self.check_evidence(path, neo_evidence=hardware_document(),
+                                       installer_data=catalog_path.parent / "installer-data")
+
+        # The Neo moved onto the M1, M2 and M3 payload.
+        moved = json.loads(json.dumps(original))
+        legacy = next(model for model in moved["models"] if model["deviceIdentifier"] == "apple,j274")
+        neo = next(model for model in moved["models"] if model["deviceIdentifier"] == "apple,j700")
+        for key in ("payloadDigest", "metadataDigest", "evidenceRevision", "payloadArtifact", "metadataArtifact"):
+            neo[key] = legacy[key]
+        self.assert_refused(check(moved), "each hardware profile needs its own image")
+        # An M3 moved onto the Neo payload.
+        moved = json.loads(json.dumps(original))
+        neo = next(model for model in moved["models"] if model["deviceIdentifier"] == "apple,j700")
+        air = next(model for model in moved["models"] if model["deviceIdentifier"] == "apple,j613")
+        for key in ("payloadDigest", "metadataDigest", "evidenceRevision", "payloadArtifact", "metadataArtifact"):
+            air[key] = neo[key]
+        self.assert_refused(check(moved), "each hardware profile needs its own image")
+        # A Neo payload pinned with the M1, M2 and M3 installer_data, which refuses the Neo.
+        swapped = json.loads(json.dumps(original))
+        neo = next(model for model in swapped["models"] if model["deviceIdentifier"] == "apple,j700")
+        neo["metadataDigest"] = f"sha256:{sha(METADATA)}"
+        self.assert_refused(check(swapped), "it refuses apple,j700")
+        self.assertEqual(check(original).returncode, 0)
+
+    def test_neo_hardware_evidence_is_refused_off_edge(self) -> None:
+        self.assertEqual(self.prepare_with_neo().returncode, 0)
+        catalog_path = self.directory / "out" / "catalog-edge.json"
+        for channel in ("rc", "stable"):
+            with self.subTest(channel):
+                renamed = self.directory / f"catalog-{channel}.json"
+                shutil.copyfile(catalog_path, renamed)
+                self.assert_refused(self.check_evidence(renamed, neo_evidence=hardware_document(),
+                                                        installer_data=catalog_path.parent / "installer-data"),
+                                    "rc and stable come from promotion")
+                with self.assertRaisesRegex(release.Refusal, f"edge only, not {channel}"):
+                    release.check_hardware_evidence(hardware_document(), NEO_IMAGE, sha(NEO_PAYLOAD), channel,
+                                                    installer_document("2.3.0"))
 
     # ── inputs ───────────────────────────────────────────────────────────────
 
@@ -791,6 +971,12 @@ class PromotionTests(ReleaseTestCase):
         tampered = json.loads((out / "source.signed.json").read_text())
         tampered["signature"] = base64.b64encode(b"\0" * 64).decode()
         self.assert_refused(check(source=self.write("source.signed.json", tampered)), "does not verify")
+
+    def test_an_edge_catalog_with_the_neo_image_is_never_promoted(self) -> None:
+        self.assertEqual(self.prepare_with_neo("neo").returncode, 0)
+        self.assertEqual(self.sign(self.directory / "neo" / "catalog-edge.json", out="neo-signed").returncode, 0)
+        self.assertEqual(self.publish("edge", self.directory / "neo-signed" / "catalog-edge.signed.json").returncode, 0)
+        self.assert_refused(self.promote(), "a promotion needs exactly one image")
 
     def test_promotion_only_moves_forward(self) -> None:
         for channel, source in (("rc", "rc"), ("rc", "stable"), ("edge", "edge"), ("stable", "stable"),
