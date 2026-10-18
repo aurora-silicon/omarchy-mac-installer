@@ -9,9 +9,13 @@ name: Mac catalog
 #            bytes and that each image's installer_data.json admits exactly
 #            the Macs the catalog gives it, and builds catalog-<channel>.json
 #            enabling every supported M1, M2 and M3 Mac. The Neo image goes in
-#            only with a passing hardware install record for its sha256; when
-#            any of its checks fails it is left out with a warning, and the
-#            catalog offers the M1, M2 and M3 image alone
+#            only with a passing hardware install record for its sha256: a new
+#            one from the neo-* inputs, or else the one the published edge
+#            catalog pins, carried forward with the hardware-evidence.json
+#            published beside it and every check run again. When any Neo check
+#            or download fails it is left out with a warning, and the catalog
+#            offers the M1, M2 and M3 image alone. Only the record of a Neo the
+#            catalog carries reaches the signing job
 #   release  mac-catalog-sign.yml, shared with the promote workflow: signs in
 #            the catalog-release environment (main only, the owner approves
 #            each run) after re-checking the evidence, then publishes from a
@@ -209,7 +213,9 @@ jobs:
           inputs=$RUNNER_TEMP/catalog-inputs
           installer=()
           [[ ! -f $inputs/installer.json ]] || installer=(--installer "$inputs/installer.json")
-          neo=()
+          # Without a new Neo image, the published one carries forward if it
+          # still checks out.
+          neo=(--carry-neo)
           if [[ -f $inputs/neo-image ]]; then
             neo=(--neo-image "$(<"$inputs/neo-image")" --neo-payload "$inputs/neo-payload.json"
               --neo-installer-data "$inputs/neo-installer-data.json" --neo-evidence "$inputs/neo-evidence.json")
@@ -227,8 +233,11 @@ jobs:
             echo "::warning::the MacBook Neo image is left out; this catalog offers the M1, M2 and M3 image alone: ${neo_status#dropped: }"
           {
             echo "### Catalog for \`$(<"$inputs/image")\`"
-            [[ $neo_status != dropped:* ]] ||
-              echo "> **Warning:** the MacBook Neo image is left out; this catalog offers the M1, M2 and M3 image alone."
+            case $neo_status in
+              dropped:*) echo "> **Warning:** the MacBook Neo image is left out; this catalog offers the M1, M2 and M3 image alone." ;;
+              "included carried "*) echo "The MacBook Neo image is carried forward from the published edge catalog." ;;
+              "included new "*) echo "The MacBook Neo image is new, from this run's hardware install record." ;;
+            esac
             echo '```'
             cat "$inputs/prepare.log"
             echo '```'

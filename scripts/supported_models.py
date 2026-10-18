@@ -101,8 +101,10 @@ def admitted(installer_data: object) -> list[str]:
     excluded_device_classes."""
     supported, _ = load()
     os_list = installer_data.get("os_list") if isinstance(installer_data, dict) else None
+    if not isinstance(os_list, list):
+        raise ValueError("installer_data.json has no os_list")
     targets = [
-        target for target in os_list or []
+        target for target in os_list
         if isinstance(target, dict) and target.get("omarchy_target") == "apple-silicon-full-os"
     ]
     if len(targets) != 1:

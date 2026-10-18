@@ -132,7 +132,8 @@ class Ordering(unittest.TestCase):
 
     def test_the_chain_is_build_acceptance_inputs_upload_catalog(self):
         self.assertEqual(list(self.jobs), ["plan", "build", "acceptance", "catalog-inputs", "upload", "neo-recovery",
-                                           "neo-build", "neo-evidence", "neo-upload", "neo", "catalog"])
+                                           "neo-build", "neo-evidence", "neo-upload", "neo", "neo-build-report",
+                                           "catalog"])
         self.assertEqual(field(self.jobs["build"], "needs"), "plan")
         self.assertEqual(field(self.jobs["acceptance"], "needs"), "build")
         self.assertEqual(field(self.jobs["upload"], "needs"), "[build, acceptance, catalog-inputs]")
@@ -170,8 +171,20 @@ class Ordering(unittest.TestCase):
         self.assertEqual(field(self.jobs["neo-build"], "needs"), "neo-recovery")
         self.assertEqual(field(self.jobs["neo-evidence"], "needs"), "plan")
         self.assertEqual(field(self.jobs["neo-upload"], "needs"), "[neo-evidence, upload]")
-        self.assertEqual(field(self.jobs["neo"], "needs"), "[neo-build, neo-evidence, neo-upload]")
+        self.assertEqual(field(self.jobs["neo"], "needs"), "[neo-evidence, neo-upload]")
         self.assertEqual(field(self.jobs["neo"], "if"), "${{ !cancelled() }}")
+        # The catalog never waits for this run's Neo build, which only reports.
+        self.assertEqual(field(self.jobs["neo-build-report"], "needs"), "neo-build")
+        self.assertEqual(field(self.jobs["neo-build-report"], "if"), "${{ !cancelled() }}")
+        upstream, frontier = set(), ["catalog"]
+        while frontier:
+            needs = field(self.jobs[frontier.pop()], "needs").strip("[]")
+            for need in filter(None, (item.strip() for item in needs.split(","))):
+                if need not in upstream:
+                    upstream.add(need)
+                    frontier.append(need)
+        self.assertNotIn("neo-build", upstream)
+        self.assertNotIn("neo-recovery", upstream)
         self.assertEqual(field(self.jobs["neo-evidence"], "if"), "inputs.neo-hardware-evidence != ''")
 
     def test_the_neo_image_is_built_by_mac_image_and_gated_by_its_hardware_record(self):
@@ -182,6 +195,7 @@ class Ordering(unittest.TestCase):
         self.assertIn("bash Recovery/build-recovery.sh", self.jobs["neo-recovery"])
         # No VM acceptance for the Neo image, and no VM evidence for its upload.
         self.assertNotIn("mac-acceptance.yml", build + upload_job + self.jobs["neo"])
+        self.assertIn("neo=(--carry-neo)", text(WORKFLOWS / "mac-catalog.yml"))
         self.assertNotIn("evidence-artifact", upload_job)
         for line in ("image-artifact: ${{ needs.neo-evidence.outputs.image }}",
                      "image-sha256: ${{ needs.neo-evidence.outputs.sha256 }}",
@@ -841,11 +855,14 @@ class NeoSteps(unittest.TestCase):
                 self.assertEqual(output, "")
 
     def pick(self, **env: str) -> tuple[int, str, str]:
-        defaults = {"BUILD": "success", "BUILT": "omarchy-mac-edge-2026.10.19-aaaaaaaaaaaa", "BUILT_SHA256": SHA,
-                    "EVIDENCE_GIVEN": "true", "EVIDENCE": "success", "UPLOAD": "success", "IMAGE": self.NEO,
+        defaults = {"EVIDENCE_GIVEN": "true", "EVIDENCE": "success", "UPLOAD": "success", "IMAGE": self.NEO,
                     "PAYLOAD": '{"url":"x"}', "INSTALLER_DATA": '{"url":"y"}', "RECORD": '{"result":"pass"}',
                     "DRY_RUN": "false"}
-        return self.run_step(PIPELINE, "Offer the Neo image or say why not", **{**defaults, **env})
+        return self.run_step(PIPELINE, "Offer the new Neo image or say why not", **{**defaults, **env})
+
+    def report(self, build: str) -> tuple[int, str, str]:
+        return self.run_step(PIPELINE, "Say how this run's Neo build went", BUILD=build,
+                             BUILT="omarchy-mac-edge-2026.10.19-aaaaaaaaaaaa", BUILT_SHA256=SHA)
 
     def test_a_passing_neo_goes_to_the_catalog(self):
         status, output, summary = self.pick()
@@ -853,23 +870,28 @@ class NeoSteps(unittest.TestCase):
         self.assertEqual(output, f'image={self.NEO}\npayload={{"url":"x"}}\ninstaller-data={{"url":"y"}}\n'
                                  'evidence={"result":"pass"}\n')
         self.assertIn("the catalog offers it", summary)
-        self.assertIn("neo-image-run-id=42", summary)
 
-    def test_any_neo_failure_leaves_the_m1_m2_m3_catalog_with_a_warning(self):
+    def test_any_new_neo_failure_hands_the_catalog_nothing_with_a_warning(self):
         for change in ({"UPLOAD": "failure"}, {"EVIDENCE": "failure", "UPLOAD": "skipped"},
-                       {"UPLOAD": "success", "PAYLOAD": ""}, {"BUILD": "failure", "UPLOAD": "cancelled"}):
+                       {"UPLOAD": "success", "PAYLOAD": ""}, {"UPLOAD": "cancelled"}):
             with self.subTest(change):
                 status, output, summary = self.pick(**change)
                 self.assertEqual(status, 0, self.output)
                 self.assertEqual(output, "")
-                self.assertIn("::warning::the Neo image is left out", summary)
-                self.assertIn("offers the M1, M2 and M3 image alone", summary)
+                self.assertIn("::warning::the new Neo image is left out", summary)
+                self.assertIn("carries forward the published Neo image", summary)
 
-    def test_no_record_is_the_m1_m2_m3_catalog_and_a_failed_build_warns(self):
-        status, output, summary = self.pick(EVIDENCE_GIVEN="false", EVIDENCE="skipped", UPLOAD="skipped",
-                                            PAYLOAD="", BUILD="failure")
+    def test_no_record_hands_the_catalog_nothing_so_it_carries_forward(self):
+        status, output, summary = self.pick(EVIDENCE_GIVEN="false", EVIDENCE="skipped", UPLOAD="skipped", PAYLOAD="")
         self.assertEqual((status, output), (0, ""), self.output)
-        self.assertIn("No Neo hardware evidence was supplied", summary)
+        self.assertIn("No new Neo hardware install record was supplied", summary)
+
+    def test_the_build_report_names_the_image_or_warns(self):
+        status, _, summary = self.report("success")
+        self.assertEqual(status, 0, self.output)
+        self.assertIn("neo-image-run-id=42", summary)
+        status, _, summary = self.report("failure")
+        self.assertEqual(status, 0, self.output)
         self.assertIn("::warning::the Neo image did not build in this run (failure)", summary)
 
     def test_a_dry_run_hands_the_catalog_nothing(self):

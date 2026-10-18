@@ -207,6 +207,62 @@ class ReleaseTestCase(unittest.TestCase):
         return self.prepare("default", None, out, neo={**neo_documents(), **changes},
                             installer=installer_document("2.3.0"))
 
+    def prepare_arguments(self, out: str, *extra: str, neo: dict | None = None,
+                          installer: dict | None = None) -> list[str]:
+        arguments = [
+            "prepare", "--channel", "edge", "--image", IMAGE,
+            "--payload", str(self.write("payload.json", payload_document())),
+            "--engine", str(self.write("engine.json", engine_document())),
+            "--installer-data", str(self.write("metadata.json", artifact(IMAGE, "installer_data.json", METADATA))),
+            "--installer", str(self.write("installer.json", installer or installer_document("2.3.0"))),
+            "--evidence", str(self.write("evidence.json", evidence_document())),
+            "--installer-data-dir", str(self.installer_data_dir()),
+            "--now", NOW, "--out", str(self.directory / out), *extra,
+        ]
+        if neo is not None:
+            arguments += ["--neo-image", neo.get("image", NEO_IMAGE),
+                          "--neo-payload", str(self.write("neo-payload.json", neo["payload"])),
+                          "--neo-installer-data", str(self.write("neo-metadata.json", neo["installer_data"])),
+                          "--neo-evidence", str(self.write("neo-evidence.json", neo["evidence"]))]
+        return arguments
+
+    def in_process(self, arguments: list[str], served: dict) -> tuple[int, str, list[str]]:
+        """release.main with every URL served from SERVED (bytes, or an
+        exception to raise); returns the status, output and URLs asked for."""
+        requested = []
+
+        def fake_open(url, timeout=60):
+            requested.append(url)
+            answer = served.get(url, urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO()))
+            if isinstance(answer, BaseException):
+                raise answer
+            return contextlib.closing(io.BytesIO(answer))
+
+        saved = release.open_url, dict(os.environ)
+        release.open_url = fake_open
+        os.environ.update(PATH=self.environment["PATH"], OMARCHY_OPENSSL=OPENSSL)
+        os.environ.pop("GITHUB_REPOSITORY", None)
+        try:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                status = release.main(arguments)
+            return status, output.getvalue(), requested
+        finally:
+            release.open_url = saved[0]
+            os.environ.clear()
+            os.environ.update(saved[1])
+
+    def served_legacy(self) -> dict:
+        served = {part["url"]: data for part, data in zip(payload_document()["parts"], PAYLOAD_PARTS)}
+        served[engine_document()["url"]] = ENGINE
+        served[artifact(IMAGE, "installer_data.json", METADATA)["url"]] = METADATA
+        return served
+
+    def served_neo(self) -> dict:
+        documents = neo_documents()
+        return {documents["payload"]["url"]: NEO_PAYLOAD, documents["installer_data"]["url"]: NEO_METADATA,
+                f"{release_base(NEO_IMAGE)}/hardware-evidence.json": json.dumps(hardware_document()).encode()}
+
     def check_evidence(self, catalog: Path, evidence: object = "default", neo_evidence: object = None,
                        installer_data: Path | None = None) -> subprocess.CompletedProcess:
         arguments = ["check-evidence", "--catalog", str(catalog),
@@ -214,7 +270,10 @@ class ReleaseTestCase(unittest.TestCase):
         if evidence is not None:
             arguments += ["--evidence", str(self.write("e.json", evidence_document() if evidence == "default"
                                                        else evidence))]
-        if neo_evidence is not None:
+        if isinstance(neo_evidence, str):
+            (self.directory / "ne.json").write_text(neo_evidence)
+            arguments += ["--neo-evidence", str(self.directory / "ne.json")]
+        elif neo_evidence is not None:
             arguments += ["--neo-evidence", str(self.write("ne.json", neo_evidence))]
         return self.run_tool(*arguments)
 
@@ -362,7 +421,7 @@ class CatalogReleaseTests(ReleaseTestCase):
     def test_a_neo_image_with_hardware_evidence_gets_only_the_neo(self) -> None:
         result = self.prepare_with_neo()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"neo=included {NEO_IMAGE} {sha(NEO_PAYLOAD)}", result.stdout)
+        self.assertIn(f"neo=included new {NEO_IMAGE} {sha(NEO_PAYLOAD)}", result.stdout)
         catalog_path = self.directory / "out" / "catalog-edge.json"
         catalog = json.loads(catalog_path.read_text())
         supported, _ = release.supported_models.load()
@@ -411,7 +470,7 @@ class CatalogReleaseTests(ReleaseTestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("neo=dropped: ", result.stdout)
                 self.assertIn(reason, result.stdout)
-                self.assertIn("warning: the Neo image is left out of the catalog", result.stderr)
+                self.assertIn("Neo image is left out of the catalog", result.stderr)
                 catalog_path = self.directory / f"out-{len(reason)}" / "catalog-edge.json"
                 catalog = json.loads(catalog_path.read_text())
                 self.assertNotIn("apple,j700", [model["deviceIdentifier"] for model in catalog["models"]])
@@ -421,6 +480,107 @@ class CatalogReleaseTests(ReleaseTestCase):
         result = self.prepare("default", None, "old-app", neo=neo_documents())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("needs installer.minimumVersion >= 2.3.0", result.stdout)
+
+    def test_a_neo_image_that_cannot_be_fetched_or_read_leaves_the_m1_m2_m3_catalog(self) -> None:
+        documents = neo_documents()
+        payload_url, metadata_url = documents["payload"]["url"], documents["installer_data"]["url"]
+        malformed = b'{"os_list": 1}\n'
+        cases = {
+            "404": ({payload_url: urllib.error.HTTPError(payload_url, 404, "Not Found", {}, io.BytesIO())}, documents),
+            "timed out": ({payload_url: TimeoutError("timed out")}, documents),
+            "metadata unreachable": ({metadata_url: urllib.error.URLError("no route")}, documents),
+            "no os_list": ({metadata_url: malformed},
+                           dict(documents, installer_data=artifact(NEO_IMAGE, "installer_data.json", malformed))),
+        }
+        for reason, (change, neo) in cases.items():
+            with self.subTest(reason):
+                out = f"fetch-{reason.replace(' ', '-')}"
+                status, output, _ = self.in_process(
+                    self.prepare_arguments(out, "--verify-remote", neo=neo),
+                    {**self.served_legacy(), **self.served_neo(), **change})
+                self.assertEqual(status, 0, output)
+                self.assertIn("neo=dropped: new Neo image", output)
+                catalog = json.loads((self.directory / out / "catalog-edge.json").read_text())
+                self.assertEqual(len(catalog["models"]), 34)
+                self.assertFalse((self.directory / out / "neo-evidence.json").exists())
+
+    def test_a_dropped_neo_record_never_blocks_signing_the_m1_m2_m3_catalog(self) -> None:
+        out = self.directory / "out"
+        out.mkdir()
+        (out / "neo-evidence.json").write_text("{")  # what the workflow recorded
+        result = self.prepare("default", None, "out", neo=dict(neo_documents(), evidence=None),
+                              installer=installer_document("2.3.0"))
+        self.assertIn("neo=dropped", result.stdout)
+        self.assertFalse((out / "neo-evidence.json").exists())
+        checked = self.check_evidence(out / "catalog-edge.json", neo_evidence="{ not json")
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        # With the Neo in the catalog, prepare leaves the record it accepted for the signer.
+        self.assertEqual(self.prepare_with_neo("with-neo").returncode, 0)
+        self.assertEqual(json.loads((self.directory / "with-neo" / "neo-evidence.json").read_text()),
+                         hardware_document())
+
+    def publish_neo_edge(self) -> Path:
+        host = self.directory / "scratch-host"
+        self.assertEqual(self.prepare_with_neo("published").returncode, 0)
+        self.assertEqual(self.sign(self.directory / "published" / "catalog-edge.json", out="published-signed").returncode, 0)
+        published = self.run_tool("publish", "--channel", "edge", "--envelope",
+                                  str(self.directory / "published-signed" / "catalog-edge.signed.json"),
+                                  "--host", f"scratch:{host}", "--trust-root", str(self.trust_root))
+        self.assertEqual(published.returncode, 0, published.stderr)
+        return host
+
+    def carry(self, out: str, served: dict, *extra: str, neo: dict | None = None) -> tuple[int, str, list[str]]:
+        host = self.directory / "scratch-host"
+        return self.in_process(self.prepare_arguments(out, "--carry-neo", "--host", f"scratch:{host}",
+                                                      "--trust-root", str(self.trust_root), *extra, neo=neo), served)
+
+    def test_without_a_new_record_the_published_neo_image_is_carried_forward(self) -> None:
+        self.publish_neo_edge()
+        status, output, requested = self.carry("carried", {**self.served_legacy(), **self.served_neo()},
+                                               "--verify-remote")
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"neo=included carried {NEO_IMAGE} {sha(NEO_PAYLOAD)}", output)
+        self.assertIn(neo_documents()["payload"]["url"], requested)
+        catalog_path = self.directory / "carried" / "catalog-edge.json"
+        neo = next(m for m in json.loads(catalog_path.read_text())["models"] if m["deviceIdentifier"] == "apple,j700")
+        self.assertEqual((neo["payloadDigest"], neo["evidenceRevision"]), (f"sha256:{sha(NEO_PAYLOAD)}", NEO_IMAGE))
+        checked = self.check_evidence(catalog_path, neo_evidence=json.loads(
+            (self.directory / "carried" / "neo-evidence.json").read_text()))
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_a_carried_neo_image_that_no_longer_checks_out_is_dropped(self) -> None:
+        self.publish_neo_edge()
+        evidence_url = f"{release_base(NEO_IMAGE)}/hardware-evidence.json"
+        payload_url = neo_documents()["payload"]["url"]
+        cases = {
+            f"not {sha(NEO_PAYLOAD)}": {evidence_url: json.dumps(hardware_document(image_sha256="d" * 64)).encode()},
+            "HTTP Error 404": {evidence_url: urllib.error.HTTPError(evidence_url, 404, "Not Found", {}, io.BytesIO())},
+            "not the pinned": {payload_url: NEO_PAYLOAD[:-1] + b"X"},
+            "older than the catalog's": {evidence_url: json.dumps(hardware_document(installer_version="2.2.0")).encode()},
+        }
+        for reason, change in cases.items():
+            with self.subTest(reason):
+                out = f"refused-{len(reason)}"
+                status, output, _ = self.carry(out, {**self.served_legacy(), **self.served_neo(), **change},
+                                               "--verify-remote")
+                self.assertEqual(status, 0, output)
+                self.assertIn("neo=dropped: carried Neo image", output)
+                self.assertIn(reason, output)
+                catalog = json.loads((self.directory / out / "catalog-edge.json").read_text())
+                self.assertEqual(len(catalog["models"]), 34)
+
+    def test_a_new_record_replaces_the_carried_neo_image(self) -> None:
+        self.publish_neo_edge()
+        newer = "omarchy-mac-edge-2026.10.15-abcdefabcdef"
+        payload = b"newer-neo" * 50
+        neo = {"image": newer, "payload": artifact(newer, f"{newer}.zip", payload),
+               "installer_data": artifact(newer, "installer_data.json", NEO_METADATA),
+               "evidence": hardware_document(image=newer, image_sha256=sha(payload))}
+        status, output, requested = self.carry("override", {}, neo=neo)
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"neo=included new {newer} {sha(payload)}", output)
+        self.assertEqual(requested, [], "a new record needs nothing from the published catalog")
+        self.assertNotIn(NEO_IMAGE, (self.directory / "override" / "catalog-edge.json").read_text())
 
     def test_the_legacy_image_still_fails_closed_beside_a_neo_image(self) -> None:
         result = self.prepare(evidence_document("f" * 64), None, "out", neo=neo_documents(),

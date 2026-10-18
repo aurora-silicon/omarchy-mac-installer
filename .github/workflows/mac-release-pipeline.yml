@@ -41,9 +41,13 @@ name: Mac release pipeline
 #               (scripts/hardware_evidence.py)
 #   neo-upload  mac-upload.yml for that earlier image, gated by the record in
 #               place of VM evidence
-#   neo         always: hands the catalog the Neo inputs when every Neo step
-#               passed, and otherwise says in the run summary why the catalog
-#               offers the M1, M2 and M3 image alone
+#   neo         always: hands the catalog the new Neo inputs when the record
+#               check and upload passed, and otherwise none, in which case the
+#               catalog carries forward the Neo image the published edge
+#               catalog pins if it still checks out (mac-catalog.yml)
+#   neo-build-report  says in the run summary whether this run's Neo build
+#               passed and how to qualify it. Nothing waits for it: the
+#               catalog never uses this run's Neo build
 #
 # Data passes as job outputs (image name, sha256, evidence artifact and run,
 # catalog inputs) and as artifacts of this run (the image, the evidence
@@ -60,9 +64,9 @@ name: Mac release pipeline
 #
 # Started by edge-dispatch.yml (gh workflow run, dry-run=false) when an edge
 # publish changes a package the image installs, or by hand (dry run by
-# default). Never for pull requests. Only a hand dispatch can supply the Neo's
-# hardware evidence, so an edge-dispatch run offers the M1, M2 and M3 image
-# alone.
+# default). Never for pull requests. Only a hand dispatch can supply a new
+# Neo hardware install record; an edge-dispatch run carries the published Neo
+# image forward instead.
 
 on:
   workflow_dispatch:
@@ -314,8 +318,8 @@ jobs:
 
   neo:
     name: Neo for the catalog
-    needs: [neo-build, neo-evidence, neo-upload]
-    # Even after a Neo failure, which only leaves the Neo out of the catalog.
+    needs: [neo-evidence, neo-upload]
+    # Even after a Neo failure, which only leaves the new Neo out of the catalog.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -326,12 +330,9 @@ jobs:
       installer-data: ${{ steps.pick.outputs.installer-data }}
       evidence: ${{ steps.pick.outputs.evidence }}
     steps:
-      - name: Offer the Neo image or say why not
+      - name: Offer the new Neo image or say why not
         id: pick
         env:
-          BUILD: ${{ needs.neo-build.result }}
-          BUILT: ${{ needs.neo-build.outputs.name }}
-          BUILT_SHA256: ${{ needs.neo-build.outputs.sha256 }}
           EVIDENCE_GIVEN: ${{ inputs.neo-hardware-evidence != '' }}
           EVIDENCE: ${{ needs.neo-evidence.result }}
           UPLOAD: ${{ needs.neo-upload.result }}
@@ -343,19 +344,12 @@ jobs:
         run: |
           set -euo pipefail
           summary() { printf '%s\n' "$@" >>"$GITHUB_STEP_SUMMARY"; }
-          summary "### MacBook Neo"
-          if [[ $BUILD == success ]]; then
-            summary "This run built the Neo image \`$BUILT\` (sha256 \`$BUILT_SHA256\`, run $GITHUB_RUN_ID)." \
-              "To offer it, install it on a MacBook Neo and dispatch this pipeline with its hardware install record" \
-              "(neo-hardware-evidence) and neo-image-run-id=$GITHUB_RUN_ID within 14 days."
-          else
-            echo "::warning::the Neo image did not build in this run ($BUILD); the M1, M2 and M3 image is not affected"
-            summary "> **Warning:** the Neo image did not build in this run ($BUILD)."
-          fi
+          summary "### MacBook Neo for the catalog"
+          carry="the catalog carries forward the published Neo image if it still checks out, or offers the M1, M2 and M3 image alone"
           if [[ $EVIDENCE_GIVEN != true ]]; then
-            summary "No Neo hardware evidence was supplied: the catalog offers the M1, M2 and M3 image alone."
+            summary "No new Neo hardware install record was supplied: $carry."
           elif [[ $EVIDENCE == success && $UPLOAD == success && ($DRY_RUN == true || -n $PAYLOAD) ]]; then
-            summary "The Neo image \`$IMAGE\` has its hardware install record and is uploaded; the catalog offers it."
+            summary "The new Neo image \`$IMAGE\` has its hardware install record and is uploaded; the catalog offers it."
             if [[ $DRY_RUN != true ]]; then
               {
                 echo "image=$IMAGE"
@@ -365,8 +359,34 @@ jobs:
               } >>"$GITHUB_OUTPUT"
             fi
           else
-            echo "::warning::the Neo image is left out (hardware evidence $EVIDENCE, upload $UPLOAD); the catalog offers the M1, M2 and M3 image alone"
-            summary "> **Warning:** the Neo image is left out (hardware evidence $EVIDENCE, upload $UPLOAD); the catalog offers the M1, M2 and M3 image alone."
+            echo "::warning::the new Neo image is left out (hardware evidence $EVIDENCE, upload $UPLOAD); $carry"
+            summary "> **Warning:** the new Neo image is left out (hardware evidence $EVIDENCE, upload $UPLOAD); $carry."
+          fi
+
+  neo-build-report:
+    name: Neo build report
+    needs: neo-build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Say how this run's Neo build went
+        env:
+          BUILD: ${{ needs.neo-build.result }}
+          BUILT: ${{ needs.neo-build.outputs.name }}
+          BUILT_SHA256: ${{ needs.neo-build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          summary() { printf '%s\n' "$@" >>"$GITHUB_STEP_SUMMARY"; }
+          summary "### MacBook Neo build"
+          if [[ $BUILD == success ]]; then
+            summary "This run built the Neo image \`$BUILT\` (sha256 \`$BUILT_SHA256\`, run $GITHUB_RUN_ID)." \
+              "To offer it, install it on a MacBook Neo and dispatch this pipeline with its hardware install record" \
+              "(neo-hardware-evidence) and neo-image-run-id=$GITHUB_RUN_ID within 14 days."
+          else
+            echo "::warning::the Neo image did not build in this run ($BUILD); the catalog does not use it, and the M1, M2 and M3 image is not affected"
+            summary "> **Warning:** the Neo image did not build in this run ($BUILD)."
           fi
 
   catalog:

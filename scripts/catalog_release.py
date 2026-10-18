@@ -9,8 +9,11 @@ as its own job, so the job that holds the catalog key does nothing but sign:
                   every artifact URL serves the pinned bytes, and write the
                   unsigned catalog-<channel>.json. On edge it may add the
                   MacBook Neo's own image, gated by a recorded hardware
-                  install instead (scripts/hardware_evidence.py); a Neo image
-                  that fails any check is dropped with a warning, and the
+                  install instead (scripts/hardware_evidence.py). Without a
+                  new Neo image, --carry-neo re-offers the one the published
+                  edge catalog pins, re-checked with the hardware-evidence.json
+                  published beside it. A Neo image that fails any check, or
+                  cannot be fetched, is dropped with a warning, and the
                   catalog offers the M1, M2 and M3 image alone
   check-evidence  re-check each payload of a built catalog against its
                   evidence and the Macs its installer_data.json admits (the
@@ -94,6 +97,8 @@ SCENARIO_RESULTS = ("pass", "fail", "skip")
 MAXIMUM_PART_COUNT = 16
 MAXIMUM_CATALOG_BYTES = 1_048_576
 MAXIMUM_INSTALLER_DATA_BYTES = 1_048_576
+MAXIMUM_HARDWARE_EVIDENCE_BYTES = 65_536
+HARDWARE_EVIDENCE_NAME = "hardware-evidence.json"
 # The first app release whose edge catalog offers the MacBook Neo its own
 # image (the owner's decision): a catalog with a second image needs it.
 OWN_IMAGE_MINIMUM_INSTALLER = (2, 3, 0)
@@ -113,6 +118,10 @@ PUBLIC_KEY_DER_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 class Refusal(Exception):
     """An input, evidence record or host state the release must not accept."""
+
+
+# What fetching or reading an optional Neo input can raise besides Refusal.
+NEO_ERRORS = (Refusal, OSError, ValueError, TypeError, KeyError, AttributeError)
 
 
 # ── identity and inputs ──────────────────────────────────────────────────────
@@ -981,6 +990,32 @@ def installer_data_bytes(metadata: dict, field: str, verify_remote: bool, direct
     return data
 
 
+def carried_neo(host, channel: str, trust_root: bytes) -> tuple | None:
+    """The Neo image the published catalog pins, as prepare's Neo inputs: its
+    name, payload and installer_data documents and the hardware install
+    record published beside its payload (fetched, not trusted: check_image
+    re-checks it). None when the published catalog has no Neo."""
+    data = host.fetch(channel)
+    if data is None:
+        return None
+    catalog = verify_envelope(data, trust_root)
+    models = [model for model in catalog.get("models", []) if isinstance(model, dict)
+              and model.get("deviceIdentifier") in supported_models.load()[0]
+              and supported_models.hardware_profile(model["deviceIdentifier"]) == "neo"]
+    if not models:
+        return None
+    model = models[0]
+    payload = from_catalog("neo_payload", model.get("payloadArtifact"), model.get("payloadDigest"), True)
+    metadata = from_catalog("neo_installer_data", model.get("metadataArtifact"), model.get("metadataDigest"))
+    url = check_url(payload["url"].rsplit("/", 1)[0] + "/" + HARDWARE_EVIDENCE_NAME, "neo hardware evidence",
+                    artifact_bases(), HARDWARE_EVIDENCE_NAME)
+    with open_url(url) as response:
+        record = response.read(MAXIMUM_HARDWARE_EVIDENCE_BYTES + 1)
+    if len(record) > MAXIMUM_HARDWARE_EVIDENCE_BYTES:
+        raise Refusal(f"{url} is larger than {MAXIMUM_HARDWARE_EVIDENCE_BYTES} bytes")
+    return model.get("evidenceRevision"), payload, metadata, json.loads(record)
+
+
 def command_prepare(arguments) -> None:
     check_repository()
     channel = check_channel(arguments.channel)
@@ -1002,29 +1037,36 @@ def command_prepare(arguments) -> None:
     images = [check_image(channel, arguments.image, payload, metadata, data, supported_models.LEGACY,
                           evidence, installer)]
     copies[images[0]["metadata"]["sha256"]] = data
-    neo = "not offered (no Neo image input)"
-    if arguments.neo_image:
-        # A Neo image that fails a check never holds back the M1, M2 and M3
-        # image: the catalog goes out without it.
+    neo, neo_evidence = "not offered (no Neo image input)", None
+    if arguments.neo_image or arguments.carry_neo:
+        source = "new" if arguments.neo_image else "carried"
+        # A Neo image that fails a check, or cannot be fetched, never holds
+        # back the M1, M2 and M3 image: the catalog goes out without it.
         try:
-            neo_metadata = load_json(arguments.neo_installer_data, "neo_installer_data")
+            if arguments.neo_image:
+                inputs = (arguments.neo_image, load_json(arguments.neo_payload, "neo_payload"),
+                          load_json(arguments.neo_installer_data, "neo_installer_data"),
+                          load_json(arguments.neo_evidence, "neo_evidence") if arguments.neo_evidence else None)
+            else:
+                inputs = carried_neo(catalog_host(arguments.host), channel, read_trust_root(arguments.trust_root))
+            if inputs is None:
+                raise Refusal("the published edge catalog offers no Neo image to carry forward")
+            name, neo_payload, neo_metadata, record = inputs
             neo_data = installer_data_bytes(neo_metadata, "neo_installer_data", arguments.verify_remote,
                                             arguments.installer_data_dir)
-            image = check_image(channel, arguments.neo_image, load_json(arguments.neo_payload, "neo_payload"),
-                                neo_metadata, neo_data, "neo",
-                                load_json(arguments.neo_evidence, "neo_evidence") if arguments.neo_evidence else None,
-                                installer)
+            image = check_image(channel, name, neo_payload, neo_metadata, neo_data, "neo", record, installer)
             if image["image"] == images[0]["image"] or image["payload"]["sha256"] == images[0]["payload"]["sha256"]:
                 raise Refusal("the Neo image is the M1, M2 and M3 image")
             if arguments.verify_remote:
                 verify_remote_artifact(image["payload"], "neo_payload")
-        except Refusal as error:
-            neo = f"dropped: {error}"
-            print(f"warning: the Neo image is left out of the catalog: {error}", file=sys.stderr)
+        except NEO_ERRORS as error:
+            neo = f"dropped: {source} Neo image: {error}"
+            print(f"warning: the {source} Neo image is left out of the catalog: {error}", file=sys.stderr)
         else:
             images.append(image)
             copies[image["metadata"]["sha256"]] = neo_data
-            neo = f"included {image['image']} {image['payload']['sha256']}"
+            neo_evidence = record
+            neo = f"included {source} {image['image']} {image['payload']['sha256']}"
     catalog = build_catalog(channel, images, engine, installer, now)
     if arguments.verify_remote:
         verify_remote_artifact(images[0]["payload"], "payload")
@@ -1040,6 +1082,13 @@ def command_prepare(arguments) -> None:
     (arguments.out / "installer-data").mkdir(exist_ok=True)
     for digest, document in copies.items():
         (arguments.out / "installer-data" / f"{digest}.json").write_bytes(document)
+    # The signing job checks the Neo record only when the catalog carries the
+    # Neo, and then the record prepare accepted, new or carried.
+    record_path = arguments.out / "neo-evidence.json"
+    if neo_evidence is None:
+        record_path.unlink(missing_ok=True)
+    else:
+        record_path.write_text(json.dumps(neo_evidence, indent=2) + "\n")
     output = arguments.out / f"catalog-{channel}.json"
     output.write_bytes(data)
     print(f"catalog={output}")
@@ -1058,7 +1107,6 @@ def command_check_evidence(arguments) -> None:
     if not isinstance(catalog, dict):
         raise Refusal("the catalog is not a JSON object")
     evidence = load_json(arguments.evidence, "evidence") if arguments.evidence else None
-    neo_evidence = load_json(arguments.neo_evidence, "neo_evidence") if arguments.neo_evidence else None
     for image in catalog_images(catalog):
         path = arguments.installer_data_dir / f"{image['metadata_sha256']}.json"
         if not path.is_file() or path.is_symlink():
@@ -1070,6 +1118,8 @@ def command_check_evidence(arguments) -> None:
         if image["profile"] == supported_models.LEGACY:
             check_evidence(evidence, image["payload_sha256"])
         else:
+            # Read only now: a record prepare dropped never blocks the rest.
+            neo_evidence = load_json(arguments.neo_evidence, "neo_evidence") if arguments.neo_evidence else None
             check_hardware_evidence(neo_evidence, image["image"], image["payload_sha256"], channel,
                                     catalog.get("installer"))
         print(f"evidence=passed {image['payload_sha256']} ({image['profile']}, {len(image['boards'])} Macs)")
@@ -1271,6 +1321,8 @@ def parse_arguments(argv: list[str]):
     prepare.add_argument("--neo-payload", type=Path)
     prepare.add_argument("--neo-installer-data", type=Path)
     prepare.add_argument("--neo-evidence", type=Path, help="the Neo image's hardware install record")
+    prepare.add_argument("--carry-neo", action="store_true",
+                         help="without --neo-image, re-offer the published catalog's Neo image")
     prepare.add_argument("--verify-remote", action="store_true")
     prepare.add_argument("--check-live", action="store_true")
     prepare.add_argument("--host", default="github-release")
