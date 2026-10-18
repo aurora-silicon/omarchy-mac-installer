@@ -88,7 +88,9 @@ The gate for an image the VM harness cannot boot: today only the MacBook Neo's (
 - Unknown keys are refused. `scripts/hardware_evidence.py` checks the form; `hardware_evidence.py describe FILE` checks a record before you dispatch.
 - Accepted on edge only: `check-evidence` refuses rc and stable, and promotion refuses a catalog with two images, so rc and stable stay single-image.
 - `image` and `image_sha256` must be the Neo image's name and payload digest; `board` must be a Mac with its own hardware profile (never an M1, M2 or M3, whose images pass VM acceptance); the image's IMAGE must record that board's profile and its `installer_data.json` admit that board alone; `installer_version` must be at least the catalog's `installer.minimumVersion`; `result` must be `pass`.
-- Nothing attests the record: the dispatcher supplies it and the owner reviews it in the `catalog-release` approval of the run that signs it.
+- Nothing attests the record itself: the dispatcher supplies it and the owner reviews it in the `catalog-release` approval of the run that first signs it. That catalog then pins it on the Neo entry as `qualificationEvidence` (`{"sourceURL", "fileName", "sizeBytes", "sha256"}`, the `hardware-evidence.json` published beside the payload), so the record is covered by the catalog signature. The app ignores the key, as it ignores `previewNote`. For a new record, `prepare --verify-remote` pins the published file and refuses one that says something else than the input; the signing job refuses a record whose bytes are not the pinned ones.
+- A carried Neo (`--carry-neo`) comes only from an enabled entry of a published catalog that passes the current Mac policy, and its downloaded record must match that catalog's signed `qualificationEvidence`; an edited record is refused, however small the edit.
+- Every Neo download (record, `installer_data.json`, payload) follows redirects only to the catalog base host, `github.com` and the hosts GitHub serves release assets from (`release-assets.githubusercontent.com`, earlier `objects.githubusercontent.com`). The M1, M2 and M3 downloads keep following any https redirect.
 
 ## Hosts
 

@@ -55,6 +55,7 @@ import base64
 import binascii
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -120,8 +121,10 @@ class Refusal(Exception):
     """An input, evidence record or host state the release must not accept."""
 
 
-# What fetching or reading an optional Neo input can raise besides Refusal.
-NEO_ERRORS = (Refusal, OSError, ValueError, TypeError, KeyError, AttributeError)
+# What fetching or reading an optional Neo input can raise besides Refusal:
+# network and TLS errors (OSError, urllib's among them), HTTP protocol errors
+# such as a truncated body (http.client.IncompleteRead), and malformed JSON.
+NEO_ERRORS = (Refusal, OSError, http.client.HTTPException, ValueError, TypeError, KeyError, AttributeError)
 
 
 # ── identity and inputs ──────────────────────────────────────────────────────
@@ -477,6 +480,13 @@ def build_catalog(channel: str, images: list[dict], engine: dict, installer: dic
             "metadataArtifact": plain(image["metadata"]),
             "payloadArtifact": payload_artifact(image["payload"]),
         }
+        if image["profile"] != supported_models.LEGACY:
+            # The signed pin of the hardware install record, so a carried
+            # record is the one first accepted. The app ignores the key.
+            pin = image.get("qualification")
+            if pin is None:
+                raise Refusal(f"the {image['profile']} image has no hardware install record to pin")
+            model["qualificationEvidence"] = dict(plain(pin), sha256=f"sha256:{pin['sha256']}")
         if identifier in untested:
             # The app ignores keys it does not know; ticket 12 shows this.
             model["previewNote"] = untested[identifier]
@@ -519,9 +529,11 @@ def catalog_images(catalog: dict) -> list[dict]:
             "payload_sha256": digests[0][7:], "metadata_sha256": digests[1][7:],
             "image": model.get("evidenceRevision"), "boards": [],
             "profile": supported_models.hardware_profile(model["deviceIdentifier"]),
+            "qualification": model.get("qualificationEvidence"), "model": model,
         })
-        if (image["metadata_sha256"], image["image"]) != (digests[1][7:], model.get("evidenceRevision")):
-            raise Refusal(f"the models of payload {digests[0]} pin different installer_data or images")
+        if ((image["metadata_sha256"], image["image"], image["qualification"])
+                != (digests[1][7:], model.get("evidenceRevision"), model.get("qualificationEvidence"))):
+            raise Refusal(f"the models of payload {digests[0]} pin different installer_data, records or images")
         image["boards"].append(model["deviceIdentifier"])
     profiles = [image["profile"] for image in images.values()]
     if profiles.count(supported_models.LEGACY) != 1 or len(set(profiles)) != len(profiles):
@@ -634,23 +646,43 @@ def check_promotion_mode(channel: str, real: bool, confirm: str | None, source_s
 # ── remote verification ──────────────────────────────────────────────────────
 
 
+def neo_fetch_hosts() -> frozenset[str]:
+    """Where a Neo fetch may go, redirects included: the catalog base, GitHub
+    release downloads and the hosts GitHub redirects a release asset to
+    (release-assets.githubusercontent.com today, objects.githubusercontent.com
+    before it)."""
+    return frozenset({urllib.parse.urlsplit(identity()["INSTALLER_CATALOG_BASE"]).hostname, "github.com",
+                      "release-assets.githubusercontent.com", "objects.githubusercontent.com"})
+
+
 class HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    def __init__(self, hosts: frozenset[str] | None = None):
+        super().__init__()
+        self.hosts = hosts
+
     def redirect_request(self, request, fp, code, message, headers, new_url):
-        if urllib.parse.urlsplit(new_url).scheme != "https":
+        target = urllib.parse.urlsplit(new_url)
+        if target.scheme != "https":
             raise Refusal(f"refusing a redirect to a non-https URL: {new_url}")
+        if self.hosts is not None and target.hostname not in self.hosts:
+            raise Refusal(f"refusing a redirect to {target.hostname}, which is not a release download host")
         return super().redirect_request(request, fp, code, message, headers, new_url)
 
 
-def open_url(url: str, timeout: float = 60):
-    opener = urllib.request.build_opener(HttpsOnlyRedirects())
+def open_url(url: str, timeout: float = 60, hosts: frozenset[str] | None = None):
+    """Open URL, following only https redirects, and with HOSTS only to
+    those hosts."""
+    if hosts is not None and urllib.parse.urlsplit(url).hostname not in hosts:
+        raise Refusal(f"refusing {url}: not a release download host")
+    opener = urllib.request.build_opener(HttpsOnlyRedirects(hosts))
     request = urllib.request.Request(url, headers={"User-Agent": "omarchy-mac-catalog"})
     return opener.open(request, timeout=timeout)
 
 
-def remote_digest(url: str, expected_size: int, whole=None, copy=None) -> tuple[str, int]:
+def remote_digest(url: str, expected_size: int, whole=None, copy=None, hosts=None) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
-    with open_url(url) as response:
+    with open_url(url, hosts=hosts) as response:
         while block := response.read(8 * 1024 * 1024):
             size += len(block)
             if size > expected_size:
@@ -663,13 +695,15 @@ def remote_digest(url: str, expected_size: int, whole=None, copy=None) -> tuple[
     return digest.hexdigest(), size
 
 
-def verify_remote_artifact(artifact: dict, field: str, copy: bytearray | None = None) -> None:
+def verify_remote_artifact(artifact: dict, field: str, copy: bytearray | None = None,
+                           hosts: frozenset[str] | None = None) -> None:
     """Download ARTIFACT (or its parts) and check every pinned size and
-    digest, keeping the bytes in COPY when given."""
+    digest, keeping the bytes in COPY when given, fetching only from HOSTS
+    when given."""
     whole = hashlib.sha256()
     pieces = artifact.get("parts") or [artifact]
     for piece in pieces:
-        digest, size = remote_digest(piece["url"], piece["sizeBytes"], whole, copy)
+        digest, size = remote_digest(piece["url"], piece["sizeBytes"], whole, copy, hosts)
         if (digest, size) != (piece["sha256"], piece["sizeBytes"]):
             raise Refusal(
                 f"{field}: {piece['url']} serves sha256 {digest} ({size} bytes), "
@@ -969,7 +1003,8 @@ def check_repository() -> None:
         raise Refusal(f"catalogs are released from {stopgap_repo()}, not {repository}")
 
 
-def installer_data_bytes(metadata: dict, field: str, verify_remote: bool, directory: Path | None) -> bytes:
+def installer_data_bytes(metadata: dict, field: str, verify_remote: bool, directory: Path | None,
+                         hosts: frozenset[str] | None = None) -> bytes:
     """An image's installer_data.json, which the board check reads: as its
     URL serves it with --verify-remote, otherwise <sha256>.json in DIRECTORY."""
     metadata = check_artifact(metadata, field)
@@ -977,7 +1012,7 @@ def installer_data_bytes(metadata: dict, field: str, verify_remote: bool, direct
         raise Refusal(f"{field} is larger than {MAXIMUM_INSTALLER_DATA_BYTES} bytes")
     if verify_remote:
         copy = bytearray()
-        verify_remote_artifact(metadata, field, copy)
+        verify_remote_artifact(metadata, field, copy, hosts)
         return bytes(copy)
     if directory is None:
         raise Refusal(f"the board check needs {field}: pass --verify-remote or --installer-data-dir")
@@ -990,11 +1025,27 @@ def installer_data_bytes(metadata: dict, field: str, verify_remote: bool, direct
     return data
 
 
+def evidence_url(payload: dict) -> str:
+    """Where mac-upload.yml publishes a Neo image's hardware install record:
+    beside its payload, in the image's own release."""
+    return check_url(payload["url"].rsplit("/", 1)[0] + "/" + HARDWARE_EVIDENCE_NAME, "neo hardware evidence",
+                     artifact_bases(), HARDWARE_EVIDENCE_NAME)
+
+
+def fetch_small(url: str, limit: int) -> bytes:
+    with open_url(url, hosts=neo_fetch_hosts()) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise Refusal(f"{url} is larger than {limit} bytes")
+    return data
+
+
 def carried_neo(host, channel: str, trust_root: bytes) -> tuple | None:
     """The Neo image the published catalog pins, as prepare's Neo inputs: its
-    name, payload and installer_data documents and the hardware install
-    record published beside its payload (fetched, not trusted: check_image
-    re-checks it). None when the published catalog has no Neo."""
+    name, payload and installer_data documents and the bytes of its hardware
+    install record, which must be the ones the signed catalog's
+    qualificationEvidence pins. Only an enabled Neo of a catalog that passes
+    the current policy carries forward. None when the catalog has no Neo."""
     data = host.fetch(channel)
     if data is None:
         return None
@@ -1004,16 +1055,32 @@ def carried_neo(host, channel: str, trust_root: bytes) -> tuple | None:
               and supported_models.hardware_profile(model["deviceIdentifier"]) == "neo"]
     if not models:
         return None
+    errors = supported_models.catalog_errors(catalog)
+    if errors:
+        raise Refusal("the published edge catalog fails the current Mac policy: " + "; ".join(errors))
     model = models[0]
+    if model.get("status") != "enabled":
+        raise Refusal(f"the published edge catalog lists {model['deviceIdentifier']} as {model.get('status')!r}")
     payload = from_catalog("neo_payload", model.get("payloadArtifact"), model.get("payloadDigest"), True)
     metadata = from_catalog("neo_installer_data", model.get("metadataArtifact"), model.get("metadataDigest"))
-    url = check_url(payload["url"].rsplit("/", 1)[0] + "/" + HARDWARE_EVIDENCE_NAME, "neo hardware evidence",
-                    artifact_bases(), HARDWARE_EVIDENCE_NAME)
-    with open_url(url) as response:
-        record = response.read(MAXIMUM_HARDWARE_EVIDENCE_BYTES + 1)
-    if len(record) > MAXIMUM_HARDWARE_EVIDENCE_BYTES:
-        raise Refusal(f"{url} is larger than {MAXIMUM_HARDWARE_EVIDENCE_BYTES} bytes")
-    return model.get("evidenceRevision"), payload, metadata, json.loads(record)
+    qualification = check_qualification(model, payload)
+    record = fetch_small(qualification["url"], MAXIMUM_HARDWARE_EVIDENCE_BYTES)
+    if (hashlib.sha256(record).hexdigest(), len(record)) != (qualification["sha256"], qualification["sizeBytes"]):
+        raise Refusal(f"{qualification['url']} does not match the signed catalog's qualificationEvidence")
+    return model.get("evidenceRevision"), payload, metadata, record
+
+
+def check_qualification(model: dict, payload: dict) -> dict:
+    """A Neo model's qualificationEvidence, the signed pin of its hardware
+    install record, as a check_artifact document."""
+    pin = model.get("qualificationEvidence")
+    if not isinstance(pin, dict):
+        raise Refusal(f"{model.get('deviceIdentifier')} pins no qualificationEvidence")
+    document = check_artifact(from_catalog("qualificationEvidence", {k: v for k, v in pin.items() if k != "sha256"},
+                                           pin.get("sha256")), "qualificationEvidence")
+    if document["url"] != evidence_url(payload) or document["sizeBytes"] > MAXIMUM_HARDWARE_EVIDENCE_BYTES:
+        raise Refusal(f"{model.get('deviceIdentifier')}'s qualificationEvidence is not the record beside its payload")
+    return document
 
 
 def command_prepare(arguments) -> None:
@@ -1043,29 +1110,44 @@ def command_prepare(arguments) -> None:
         # A Neo image that fails a check, or cannot be fetched, never holds
         # back the M1, M2 and M3 image: the catalog goes out without it.
         try:
+            hosts = neo_fetch_hosts()
             if arguments.neo_image:
-                inputs = (arguments.neo_image, load_json(arguments.neo_payload, "neo_payload"),
-                          load_json(arguments.neo_installer_data, "neo_installer_data"),
-                          load_json(arguments.neo_evidence, "neo_evidence") if arguments.neo_evidence else None)
+                name = arguments.neo_image
+                neo_payload = check_artifact(load_json(arguments.neo_payload, "neo_payload"), "neo_payload", True)
+                neo_metadata = load_json(arguments.neo_installer_data, "neo_installer_data")
+                if not arguments.neo_evidence:
+                    raise Refusal(f"no hardware evidence record for {name}")
+                record_bytes = arguments.neo_evidence.read_bytes()
+                if arguments.verify_remote:
+                    # The catalog pins the record as published beside the
+                    # image, which must say what the dispatcher's input says.
+                    published = fetch_small(evidence_url(neo_payload), MAXIMUM_HARDWARE_EVIDENCE_BYTES)
+                    if json.loads(published) != json.loads(record_bytes):
+                        raise Refusal(f"the record published beside {name} is not the one supplied")
+                    record_bytes = published
             else:
                 inputs = carried_neo(catalog_host(arguments.host), channel, read_trust_root(arguments.trust_root))
-            if inputs is None:
-                raise Refusal("the published edge catalog offers no Neo image to carry forward")
-            name, neo_payload, neo_metadata, record = inputs
+                if inputs is None:
+                    raise Refusal("the published edge catalog offers no Neo image to carry forward")
+                name, neo_payload, neo_metadata, record_bytes = inputs
             neo_data = installer_data_bytes(neo_metadata, "neo_installer_data", arguments.verify_remote,
-                                            arguments.installer_data_dir)
-            image = check_image(channel, name, neo_payload, neo_metadata, neo_data, "neo", record, installer)
+                                            arguments.installer_data_dir, hosts)
+            image = check_image(channel, name, neo_payload, neo_metadata, neo_data, "neo",
+                                json.loads(record_bytes), installer)
+            image["qualification"] = {"url": evidence_url(image["payload"]), "fileName": HARDWARE_EVIDENCE_NAME,
+                                      "sizeBytes": len(record_bytes),
+                                      "sha256": hashlib.sha256(record_bytes).hexdigest()}
             if image["image"] == images[0]["image"] or image["payload"]["sha256"] == images[0]["payload"]["sha256"]:
                 raise Refusal("the Neo image is the M1, M2 and M3 image")
             if arguments.verify_remote:
-                verify_remote_artifact(image["payload"], "neo_payload")
+                verify_remote_artifact(image["payload"], "neo_payload", hosts=hosts)
         except NEO_ERRORS as error:
             neo = f"dropped: {source} Neo image: {error}"
             print(f"warning: the {source} Neo image is left out of the catalog: {error}", file=sys.stderr)
         else:
             images.append(image)
             copies[image["metadata"]["sha256"]] = neo_data
-            neo_evidence = record
+            neo_evidence = record_bytes
             neo = f"included {source} {image['image']} {image['payload']['sha256']}"
     catalog = build_catalog(channel, images, engine, installer, now)
     if arguments.verify_remote:
@@ -1083,12 +1165,12 @@ def command_prepare(arguments) -> None:
     for digest, document in copies.items():
         (arguments.out / "installer-data" / f"{digest}.json").write_bytes(document)
     # The signing job checks the Neo record only when the catalog carries the
-    # Neo, and then the record prepare accepted, new or carried.
+    # Neo, and then the exact bytes its qualificationEvidence pins.
     record_path = arguments.out / "neo-evidence.json"
     if neo_evidence is None:
         record_path.unlink(missing_ok=True)
     else:
-        record_path.write_text(json.dumps(neo_evidence, indent=2) + "\n")
+        record_path.write_bytes(neo_evidence)
     output = arguments.out / f"catalog-{channel}.json"
     output.write_bytes(data)
     print(f"catalog={output}")
@@ -1119,8 +1201,16 @@ def command_check_evidence(arguments) -> None:
             check_evidence(evidence, image["payload_sha256"])
         else:
             # Read only now: a record prepare dropped never blocks the rest.
-            neo_evidence = load_json(arguments.neo_evidence, "neo_evidence") if arguments.neo_evidence else None
-            check_hardware_evidence(neo_evidence, image["image"], image["payload_sha256"], channel,
+            if not arguments.neo_evidence:
+                raise Refusal(f"no hardware evidence record for {image['image']}")
+            model = image["model"]
+            payload = from_catalog("payload", model.get("payloadArtifact"), model.get("payloadDigest"), True)
+            pin = check_qualification(model, payload)
+            load_json(arguments.neo_evidence, "neo_evidence")
+            record = arguments.neo_evidence.read_bytes()
+            if (hashlib.sha256(record).hexdigest(), len(record)) != (pin["sha256"], pin["sizeBytes"]):
+                raise Refusal(f"the hardware evidence record is not the one {image['image']}'s qualificationEvidence pins")
+            check_hardware_evidence(json.loads(record), image["image"], image["payload_sha256"], channel,
                                     catalog.get("installer"))
         print(f"evidence=passed {image['payload_sha256']} ({image['profile']}, {len(image['boards'])} Macs)")
 

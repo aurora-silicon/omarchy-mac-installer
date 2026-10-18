@@ -22,7 +22,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import http.client
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -231,7 +233,7 @@ class ReleaseTestCase(unittest.TestCase):
         exception to raise); returns the status, output and URLs asked for."""
         requested = []
 
-        def fake_open(url, timeout=60):
+        def fake_open(url, timeout=60, **_):
             requested.append(url)
             answer = served.get(url, urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO()))
             if isinstance(answer, BaseException):
@@ -370,6 +372,8 @@ class CatalogReleaseTests(ReleaseTestCase):
                                                    OPENSSL)
                 self.assertEqual(release.supported_models.catalog_errors(document), [])
                 self.assertEqual(len(release.catalog_images(document)), images)
+                neo = [m for m in document["models"] if m["deviceIdentifier"] == "apple,j700"]
+                self.assertEqual([("qualificationEvidence" in m) for m in neo], [True] * (images - 1))
 
     # ── the evidence gate ────────────────────────────────────────────────────
 
@@ -433,6 +437,10 @@ class CatalogReleaseTests(ReleaseTestCase):
         self.assertEqual(neo["evidenceRevision"], NEO_IMAGE)
         self.assertEqual(neo["payloadArtifact"]["sourceURL"], f"{release_base(NEO_IMAGE)}/{NEO_ZIP}")
         self.assertIn("previewNote", neo)
+        record = json.dumps(hardware_document()).encode()
+        self.assertEqual(neo["qualificationEvidence"], {
+            "sourceURL": f"{release_base(NEO_IMAGE)}/hardware-evidence.json", "fileName": "hardware-evidence.json",
+            "sizeBytes": len(record), "sha256": f"sha256:{sha(record)}"})
         self.assertEqual(len(by_board), 34)
         for model in by_board.values():
             self.assertEqual((model["payloadDigest"], model["evidenceRevision"]), (f"sha256:{sha(PAYLOAD)}", IMAGE))
@@ -445,10 +453,11 @@ class CatalogReleaseTests(ReleaseTestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertIn(f"evidence=passed {sha(NEO_PAYLOAD)} (neo, 1 Macs)", checked.stdout)
         self.assert_refused(self.check_evidence(catalog_path), "no hardware evidence record")
-        self.assert_refused(self.check_evidence(catalog_path, neo_evidence=hardware_document(image_sha256="d" * 64)),
-                            f"not {sha(NEO_PAYLOAD)}")
-        self.assert_refused(self.check_evidence(catalog_path, neo_evidence=hardware_document(result="fail")),
-                            "did not pass")
+        # Any other bytes, however small the edit, are not the record the catalog signs.
+        for edited in (hardware_document(image_sha256="d" * 64), hardware_document(installer_version="2.4.0"),
+                       json.dumps(hardware_document(), indent=1)):
+            self.assert_refused(self.check_evidence(catalog_path, neo_evidence=edited),
+                                "qualificationEvidence pins")
         self.assertEqual(self.sign(catalog_path).returncode, 0)
 
     def test_a_neo_image_that_fails_a_check_leaves_the_m1_m2_m3_catalog(self) -> None:
@@ -552,22 +561,82 @@ class CatalogReleaseTests(ReleaseTestCase):
         self.publish_neo_edge()
         evidence_url = f"{release_base(NEO_IMAGE)}/hardware-evidence.json"
         payload_url = neo_documents()["payload"]["url"]
+        signed = "does not match the signed catalog's qualificationEvidence"
         cases = {
-            f"not {sha(NEO_PAYLOAD)}": {evidence_url: json.dumps(hardware_document(image_sha256="d" * 64)).encode()},
-            "HTTP Error 404": {evidence_url: urllib.error.HTTPError(evidence_url, 404, "Not Found", {}, io.BytesIO())},
-            "not the pinned": {payload_url: NEO_PAYLOAD[:-1] + b"X"},
-            "older than the catalog's": {evidence_url: json.dumps(hardware_document(installer_version="2.2.0")).encode()},
+            "edited version": ({evidence_url: json.dumps(hardware_document(installer_version="2.4.0")).encode()},
+                               signed, ()),
+            "edited digest": ({evidence_url: json.dumps(hardware_document(image_sha256="d" * 64)).encode()},
+                              signed, ()),
+            "missing record": ({evidence_url: urllib.error.HTTPError(evidence_url, 404, "Not Found", {}, io.BytesIO())},
+                               "HTTP Error 404", ()),
+            "truncated record": ({evidence_url: http.client.IncompleteRead(b"{")}, "IncompleteRead", ()),
+            "changed payload": ({payload_url: NEO_PAYLOAD[:-1] + b"X"}, "not the pinned", ()),
+            "truncated payload": ({payload_url: http.client.IncompleteRead(b"neo")}, "IncompleteRead", ()),
+            "newer minimum": ({}, "older than the catalog's", ("--installer", str(self.write(
+                "newer-installer.json", installer_document("2.4.0"))))),
         }
-        for reason, change in cases.items():
+        for reason, (change, message, extra) in cases.items():
             with self.subTest(reason):
-                out = f"refused-{len(reason)}"
+                out = f"refused-{reason.replace(' ', '-')}"
                 status, output, _ = self.carry(out, {**self.served_legacy(), **self.served_neo(), **change},
-                                               "--verify-remote")
+                                               "--verify-remote", *extra)
                 self.assertEqual(status, 0, output)
                 self.assertIn("neo=dropped: carried Neo image", output)
-                self.assertIn(reason, output)
+                self.assertIn(message, output)
                 catalog = json.loads((self.directory / out / "catalog-edge.json").read_text())
                 self.assertEqual(len(catalog["models"]), 34)
+                self.assertEqual(self.check_evidence(self.directory / out / "catalog-edge.json").returncode, 0)
+
+    def test_a_disabled_neo_in_the_published_catalog_is_not_carried(self) -> None:
+        host = self.directory / "scratch-host"
+        self.assertEqual(self.prepare_with_neo("disabled").returncode, 0)
+        path = self.directory / "disabled" / "catalog-edge.json"
+        catalog = json.loads(path.read_text())
+        for model in catalog["models"]:
+            if model["deviceIdentifier"] == "apple,j700":
+                model["status"] = "disabled"
+        path.write_text(json.dumps(catalog))
+        # publish-channels envelope refuses a disabled Mac, so sign it raw: a
+        # catalog signed some other way must not slip a disabled Neo back in.
+        signature = release.openssl_sign(OPENSSL, base64.b64decode(self.key), path)
+        host.mkdir()
+        (host / "catalog-edge.signed.json").write_text(json.dumps({
+            "schema_version": 1, "catalog": base64.b64encode(path.read_bytes()).decode(),
+            "signature": base64.b64encode(signature).decode()}))
+        status, output, requested = self.carry("not-carried", {**self.served_legacy(), **self.served_neo()},
+                                               "--verify-remote")
+        self.assertEqual(status, 0, output)
+        self.assertIn("neo=dropped: carried Neo image", output)
+        self.assertIn("apple,j700 is listed but disabled", output)
+        self.assertNotIn(f"{release_base(NEO_IMAGE)}/hardware-evidence.json", requested)
+        self.assertEqual(len(json.loads((self.directory / "not-carried" / "catalog-edge.json").read_text())["models"]), 34)
+
+    def test_a_new_record_must_be_the_one_published_beside_the_image(self) -> None:
+        evidence_url = f"{release_base(NEO_IMAGE)}/hardware-evidence.json"
+        status, output, _ = self.in_process(
+            self.prepare_arguments("other-record", "--verify-remote", neo=neo_documents()),
+            {**self.served_legacy(), **self.served_neo(),
+             evidence_url: json.dumps(hardware_document(tester="someone else")).encode()})
+        self.assertEqual(status, 0, output)
+        self.assertIn("is not the one supplied", output)
+
+    def test_neo_fetches_follow_redirects_only_to_release_download_hosts(self) -> None:
+        hosts = release.neo_fetch_hosts()
+        self.assertEqual(hosts, {"mac.omarchy.org", "github.com", "release-assets.githubusercontent.com",
+                                 "objects.githubusercontent.com"})
+        handler = release.HttpsOnlyRedirects(hosts)
+        request = urllib.request.Request(f"{release_base(NEO_IMAGE)}/{NEO_ZIP}")
+        allowed = "https://release-assets.githubusercontent.com/github-production-release-asset/1/2"
+        self.assertEqual(handler.redirect_request(request, None, 302, "Found", {}, allowed).full_url, allowed)
+        for target in ("https://example.com/neo.zip", "http://release-assets.githubusercontent.com/x"):
+            with self.subTest(target), self.assertRaises(release.Refusal):
+                handler.redirect_request(request, None, 302, "Found", {}, target)
+        with self.assertRaisesRegex(release.Refusal, "not a release download host"):
+            release.open_url("https://example.com/neo.zip", hosts=hosts)
+        # The M1, M2 and M3 downloads keep following any https redirect.
+        legacy = release.HttpsOnlyRedirects()
+        self.assertEqual(legacy.redirect_request(request, None, 302, "Found", {}, "https://example.com/x").full_url,
+                         "https://example.com/x")
 
     def test_a_new_record_replaces_the_carried_neo_image(self) -> None:
         self.publish_neo_edge()
@@ -779,7 +848,7 @@ else:
         host = release.GitHubReleaseHost(release.stopgap_repo())
         served = state / "assets" / "catalog-edge.signed.json"
 
-        def fake_open(url, timeout=60):
+        def fake_open(url, timeout=60, **_):
             self.assertEqual(url, host.describe("edge"))
             if not served.exists():
                 raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO())
@@ -868,7 +937,7 @@ else:
     def test_remote_verification_checks_every_part_and_the_whole(self) -> None:
         served = {part["url"]: data for part, data in zip(payload_document()["parts"], PAYLOAD_PARTS)}
         saved = release.open_url
-        release.open_url = lambda url, timeout=60: contextlib.closing(io.BytesIO(served[url]))
+        release.open_url = lambda url, timeout=60, **_: contextlib.closing(io.BytesIO(served[url]))
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 release.verify_remote_artifact(payload_document(), "payload")
@@ -1022,7 +1091,7 @@ class PromotionTests(ReleaseTestCase):
         served[artifact(IMAGE, "installer_data.json", METADATA)["url"]] = METADATA
         requested = []
 
-        def fake_open(url, timeout=60):
+        def fake_open(url, timeout=60, **_):
             requested.append(url)
             return contextlib.closing(io.BytesIO(served[url]))
 

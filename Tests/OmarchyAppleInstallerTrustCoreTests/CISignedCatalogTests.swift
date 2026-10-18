@@ -45,7 +45,9 @@
     }
 
     /// Fixtures/ci-signed-catalog-neo: the same path's edge catalog with the
-    /// MacBook Neo's own image beside the M1, M2 and M3 one.
+    /// MacBook Neo's own image beside the M1, M2 and M3 one. Its Neo entry
+    /// also pins the hardware install record (qualificationEvidence), a key
+    /// the app does not read and must ignore.
     func testTheAppTakesEachMacsOwnImageFromATwoImageCatalog() throws {
       let fixtures = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures", withExtension: nil))
         .appendingPathComponent("ci-signed-catalog-neo")
