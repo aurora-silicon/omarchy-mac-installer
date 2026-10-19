@@ -74,6 +74,8 @@ NEO_VERSIONS.update({
     "mesa-aurora": "26.3.0_devel-1",
     "vulkan-aurora": "26.3.0_devel-1",
     "aurora-bless": "0.4.4.aurora2-1",
+    "avd-fw": "0.1.aurora1-1",
+    "upower-aurora": "1.91.4.aurora1-1",
 })
 
 

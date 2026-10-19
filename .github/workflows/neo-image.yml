@@ -1,8 +1,8 @@
-name: Neo image input check and build
+name: Neo developer candidate image
 
-# Manual, secret-free image qualification. No releases, catalogs or deployment.
-# Default: authenticate real Neo channel inputs and freeze the native template.
-# A full image build is opt-in and still does not qualify a hardware boot.
+# Manual developer candidate qualification with a separately pinned test key.
+# The exact signed package inventory is fixed by the committed manifest hash.
+# A full build remains opt-in and does not qualify a hardware boot or release.
 on:
   workflow_dispatch:
     inputs:
@@ -51,7 +51,7 @@ jobs:
           retention-days: 14
 
   image:
-    name: Check real Neo channel inputs, optionally build
+    name: Authenticate the pinned Neo development set, optionally build
     needs: recovery
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
@@ -71,23 +71,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libarchive-tools jq gnupg zstd xz-utils
-      - name: Resolve and authenticate the real edge Neo package set
+      - name: Resolve and authenticate the pinned Neo development package set
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$WORK/evidence"
           tar -xf "$WORK/recovery/native-recovery.tar" -C "$WORK/recovery"
-          bash image-builder/bin/mac-image-inputs resolve "$WORK/inputs" --channel-set --channel edge --hardware-profile neo --recovery-app "$WORK/recovery" --cache "$WORK/cache" 2>&1 | tee "$WORK/evidence/resolve.log"
+          release=$(jq -er .release Development/neo-reinstall-candidate.json)
+          manifest_sha256=$(jq -er .manifest_sha256 Development/neo-reinstall-candidate.json)
+          gh release download "$release" --repo "$GITHUB_REPOSITORY" --dir "$WORK/candidates"
+          printf '%s  %s\n' "$manifest_sha256" "$WORK/candidates/manifest.json" | sha256sum --check
+          cp "$WORK/candidates/manifest.json" "$WORK/evidence/candidate-manifest.json"
+          bash image-builder/bin/mac-image-inputs resolve "$WORK/inputs" --candidates "$WORK/candidates" --channel edge --recovery-app "$WORK/recovery" --cache "$WORK/cache" 2>&1 | tee "$WORK/evidence/resolve.log"
           cp "$WORK/inputs" "$WORK/evidence/inputs"
           cp "$WORK/recovery/source.txt" "$WORK/evidence/recovery-source.txt"
           options=(--dry-run)
           [[ $BUILD_IMAGE != true ]] || options=()
-          bash image-builder/bin/build-mac-image --inputs "$WORK/inputs" --recovery-app "$WORK/recovery" --cache "$WORK/cache" "${options[@]}" "$WORK/out" 2>&1 | tee "$WORK/evidence/build.log"
+          bash image-builder/bin/build-mac-image --inputs "$WORK/inputs" --candidates "$WORK/candidates" --recovery-app "$WORK/recovery" --cache "$WORK/cache" "${options[@]}" "$WORK/out" 2>&1 | tee "$WORK/evidence/build.log"
       - name: Check a completed image
         if: inputs.build-image
         run: |
           sudo chown -R "$(id -u):$(id -g)" "$WORK/out"
           python3 image-builder/bin/mac-image-check provenance edge "$WORK/out"
           python3 image-builder/bin/mac-image-check descriptor edge "$WORK/out"
-          sudo python3 image-builder/bin/mac-release-guard build "$WORK/out" 2>&1 | tee "$WORK/evidence/release-guard.log"
+          if python3 image-builder/bin/mac-release-guard records "$WORK/out" >"$WORK/evidence/release-guard.log" 2>&1; then
+            echo 'Developer image unexpectedly passed the public release gate' >&2
+            exit 1
+          fi
+          grep -F 'IMAGE names a candidate set: a test image, not one built from the channel' "$WORK/evidence/release-guard.log"
       - name: Save qualification artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

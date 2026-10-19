@@ -78,7 +78,9 @@ cat >"$candidates/import.json" <<'EOF'
   {"name": "omarchy-aurora-firmware", "version": "20261014-2", "filename": "fw.pkg.tar.zst", "group": "support"},
   {"name": "mesa-aurora", "version": "26.3-1", "filename": "mesa.pkg.tar.zst", "group": "support"},
   {"name": "vulkan-aurora", "version": "26.3-1", "filename": "vulkan.pkg.tar.zst", "group": "support"},
-  {"name": "aurora-bless", "version": "0.4-1", "filename": "bless.pkg.tar.zst", "group": "support"}
+  {"name": "aurora-bless", "version": "0.4-1", "filename": "bless.pkg.tar.zst", "group": "support"},
+  {"name": "avd-fw", "version": "0.1.aurora1-1", "filename": "avd.pkg.tar.zst", "group": "support"},
+  {"name": "upower-aurora", "version": "1.91.4.aurora1-1", "filename": "upower.pkg.tar.zst", "group": "support"}
 ]}
 EOF
 [[ $(qualified uboot-aurora limine gum | paste -sd' ' -) == "omarchy-candidates/uboot-aurora limine gum" ]] ||
@@ -212,7 +214,7 @@ target_pacman() {
     return
   fi
   printf '%s\n' "$@" >"$scratch/requested"
-  for name in omarchy omarchy-settings omarchy-mac omarchy-mac-boot linux-aurora aura uboot-aurora aurora-audio alsa-ucm-conf-aurora speakerguardd omarchy-aurora-firmware mesa-aurora vulkan-aurora aurora-bless; do
+  for name in omarchy omarchy-settings omarchy-mac omarchy-mac-boot linux-aurora aura uboot-aurora aurora-audio alsa-ucm-conf-aurora speakerguardd omarchy-aurora-firmware mesa-aurora vulkan-aurora aurora-bless avd-fw upower-aurora; do
     if [[ $resolution == stolen && $name == uboot-aurora ]]; then
       echo "asahi-alarm uboot-aurora 2026.07.asahi1-1"
     else
@@ -226,7 +228,7 @@ logs=$scratch/logs
 mkdir -p "$logs"
 (fail() { builder_fail "$@"; }; precheck_transaction) >/dev/null || fail "a set that resolves from itself passes the pre-check"
 cp "$candidates/import.json" "$scratch/complete-support.json"
-for required_support in aurora-audio alsa-ucm-conf-aurora speakerguardd omarchy-aurora-firmware mesa-aurora vulkan-aurora aurora-bless; do
+for required_support in aurora-audio alsa-ucm-conf-aurora speakerguardd omarchy-aurora-firmware mesa-aurora vulkan-aurora aurora-bless avd-fw upower-aurora; do
   jq --arg name "$required_support" '.packages |= map(select(.name != $name))' \
     "$scratch/complete-support.json" >"$candidates/import.json"
   if (fail() { builder_fail "$@"; }; precheck_transaction) >/dev/null 2>&1; then
@@ -239,7 +241,7 @@ pass "Neo images reject incomplete support packages before transactions"
 (fail() { builder_fail "$@"; }; precheck_transaction; printf '%s\n' "${base_names[@]}" >"$scratch/base"; printf '%s\n' "${unavailable[@]}" >"$scratch/missing") >/dev/null
 [[ $(<"$scratch/base") == hyprland && $(<"$scratch/missing") == obs-studio ]] ||
   fail "base names the pinned repositories lack are left out and recorded"
-for name in omarchy omarchy-settings omarchy-mac omarchy-mac-boot linux-aurora aura uboot-aurora aurora-audio alsa-ucm-conf-aurora speakerguardd omarchy-aurora-firmware mesa-aurora vulkan-aurora aurora-bless; do
+for name in omarchy omarchy-settings omarchy-mac omarchy-mac-boot linux-aurora aura uboot-aurora aurora-audio alsa-ucm-conf-aurora speakerguardd omarchy-aurora-firmware mesa-aurora vulkan-aurora aurora-bless avd-fw upower-aurora; do
   grep -Fxq "omarchy-candidates/$name" "$scratch/requested" || fail "the pre-check resolves $name by its qualified name"
   ! grep -Fxq "$name" "$scratch/requested" || fail "the pre-check also asks for a plain $name"
 done
@@ -279,7 +281,7 @@ mkdir -p "$target"
 mount_api() { :; }
 unmount_api() { :; }
 chown() { :; }
-pacman() { printf 'omarchy 4.0.0-1\nomarchy-settings 4.0.0-1\nomarchy-mac 0.1.0-1\nomarchy-mac-boot 20260921-10\nlinux-aurora 7.0-1\naura 1.6.1-1\nuboot-aurora 2026.07-1\naurora-audio 4.1.aurora2-1\nalsa-ucm-conf-aurora 10.aurora2-1\nspeakerguardd 0.1.0.aurora2-1\nomarchy-aurora-firmware 20261014-2\nmesa-aurora 26.3-1\nvulkan-aurora 26.3-1\naurora-bless 0.4-1\n'; }
+pacman() { printf 'omarchy 4.0.0-1\nomarchy-settings 4.0.0-1\nomarchy-mac 0.1.0-1\nomarchy-mac-boot 20260921-10\nlinux-aurora 7.0-1\naura 1.6.1-1\nuboot-aurora 2026.07-1\naurora-audio 4.1.aurora2-1\nalsa-ucm-conf-aurora 10.aurora2-1\nspeakerguardd 0.1.0.aurora2-1\nomarchy-aurora-firmware 20261014-2\nmesa-aurora 26.3-1\nvulkan-aurora 26.3-1\naurora-bless 0.4-1\navd-fw 0.1.aurora1-1\nupower-aurora 1.91.4.aurora1-1\n'; }
 target_pacman() {
   [[ -e $target/var/lib/omarchy/image/target ]] && manifest=yes || manifest=no
   printf '%s manifest=%s\n' "$*" "$manifest" >>"$scratch/transactions"
@@ -293,7 +295,7 @@ mapfile -t transactions <"$scratch/transactions"
 [[ ${transactions[0]} == *" omarchy-candidates/omarchy-settings manifest=no" && ${transactions[0]} != *linux-aurora* ]] ||
   fail "the first transaction is the base and omarchy-settings alone, before the manifest: ${transactions[0]}"
 # This fixture is a Neo set: its reviewed Mesa installs with the runtime.
-[[ ${transactions[1]} == "-S omarchy-candidates/omarchy hyprland omarchy-candidates/mesa-aurora omarchy-candidates/vulkan-aurora manifest=yes" ]] ||
+[[ ${transactions[1]} == "-S omarchy-candidates/omarchy hyprland omarchy-candidates/mesa-aurora omarchy-candidates/vulkan-aurora omarchy-candidates/upower-aurora manifest=yes" ]] ||
   fail "the runtime comes next, after the manifest: ${transactions[1]}"
 for name in omarchy-mac omarchy-mac-boot linux-aurora aura uboot-aurora; do
   [[ " ${transactions[2]} " == *" omarchy-candidates/$name "* ]] || fail "the Apple set installs $name by its qualified name"

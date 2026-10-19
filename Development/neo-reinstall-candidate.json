@@ -1,0 +1,8 @@
+{
+  "release": "neo-reinstall-20261019.1",
+  "manifest_sha256": "292fa2847717f20d300eadd498f55d092ebf61ecfd19ab0e39cec0231659cf90",
+  "hardware_profile": "neo",
+  "kernel_run": 39186478978,
+  "userspace_run": 39187407439,
+  "candidate_only": true
+}
