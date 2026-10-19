@@ -86,8 +86,11 @@ class CatalogGeneratorTests(unittest.TestCase):
         self.assertIn(fragment, result.stderr)
 
     def test_recommendation_engine_rejects_old_installer_minimum(self):
-        self.inputs["installer"]["minimum_version"] = "2.0.10"
-        self.assertRejected(self.inputs, "requires installer.minimum_version >= 2.1.0")
+        for version in ("v0.9.2-omarchy.50", "v0.9.2-omarchy.50-aurora.1"):
+            with self.subTest(version=version):
+                self.inputs["engine_version"] = version
+                self.inputs["installer"]["minimum_version"] = "2.0.10"
+                self.assertRejected(self.inputs, "requires installer.minimum_version >= 2.1.0")
 
     def test_emits_schema_four_without_an_expiry(self) -> None:
         result = self.generate()

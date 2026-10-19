@@ -141,7 +141,7 @@
     }
   },
   "downstream_overlay": {
-    "version": "v0.9.2-omarchy.50",
+    "version": "v0.9.2-omarchy.50-aurora.1",
     "capability": "candidate_bound_full_os_stage_one_authenticated_recovery",
     "engine_modes": [
       "inspect",
@@ -171,7 +171,7 @@
       {
         "path": "overlay/src/omarchy_asahi.py",
         "destination": "src/omarchy_asahi.py",
-        "sha256": "76c3c6e60bd30775b057a9c24c26aa6c804f547e1a416e8612636b08d5b44297"
+        "sha256": "d784f1c738a9e53b0dea078d69e8ffa84827bb557acbc41e9c087ff069b88cd8"
       },
       {
         "path": "overlay/src/omarchy_contract.py",
@@ -206,7 +206,7 @@
       {
         "path": "overlay/tests/test_omarchy_asahi.py",
         "destination": "tests/test_omarchy_asahi.py",
-        "sha256": "703d225137f133b7132e453a660d2f5bb012379032f70692aba2787928fbe02c"
+        "sha256": "934df9beda444be90f57ea4d12a82e0724e35c58f804ce40d6f731a0f9b72a46"
       },
       {
         "path": "overlay/tests/test_omarchy_contract.py",
@@ -256,7 +256,7 @@
       {
         "path": "overlay/src/omarchy_mt7932.py",
         "destination": "src/omarchy_mt7932.py",
-        "sha256": "bd3abd4142e3b7c5fcdac23f67aa4cc8422321e74ff0d3f87222a2ddf2aa1861"
+        "sha256": "01586a4c2f1f7aa6f7938447948d265f64ede35055262d86f34c62d943a80b9e"
       },
       {
         "path": "overlay/tests/test_omarchy_mt7932.py",
@@ -332,6 +332,11 @@
         "path": "overlay/bin/omarchy-restore-image.LICENSE",
         "destination": "bin/omarchy-restore-image.LICENSE",
         "sha256": "8e9f696e6a0191791608399c87a5c8430ae1fcdc79d66900ca6629c2177035d2"
+      },
+      {
+        "path": "overlay/tests/test_omarchy_mt7932_policy.py",
+        "destination": "tests/test_omarchy_mt7932_policy.py",
+        "sha256": "e90abce9f0abff713998a813ec577653ecfc313b64872fc2dd3538a34e306cb0"
       }
     ]
   },
@@ -350,7 +355,7 @@
     },
     {
       "path": "rebuild-python-overlay.py",
-      "sha256": "2b9861e574228f69d81e136f93336e67488a889fc788ca6dbbb10c2d5779b7ac"
+      "sha256": "ae0df0732c54d8256e0b542acf07ee8af4297a4bf1d86a427fbb4f997dff1268"
     },
     {
       "path": "RestoreImage/LICENSE",
@@ -458,9 +463,9 @@
     }
   ],
   "validation_artifact": {
-    "filename": "installer-v0.9.2-omarchy.50.tar.gz",
-    "size_bytes": 18037588,
-    "sha256": "313f91571422170094a8fa1ac65fb24002d708bba86f7a2dbfe4821f89b12e6e",
+    "filename": "installer-v0.9.2-omarchy.50-aurora.1.tar.gz",
+    "size_bytes": 18038914,
+    "sha256": "e58af29cd632754d8defed14d9a8fc49f459b431fb6200039eaf4b1db179d090",
     "reproducibility_scope": "two-identical-python-overlay-repacks-authenticated-base",
     "signature": "absent",
     "metadata_sha256": "2e6181ce6b6e17c11039e04bfadade8d10ae0e11889885ad8c9960b68f179a5d"

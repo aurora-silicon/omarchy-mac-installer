@@ -246,7 +246,7 @@ def check_installer(document: object, engine_version: str) -> dict:
             raise Refusal(f"installer.{key} must look like X.Y.Z")
     if version_tuple(document["minimumVersion"]) > version_tuple(document["latestVersion"]):
         raise Refusal("installer.minimumVersion is newer than installer.latestVersion")
-    engine = re.fullmatch(r"v0\.9\.2-omarchy\.(\d+)", engine_version)
+    engine = re.fullmatch(r"v0\.9\.2-omarchy\.(\d+)(?:-aurora\.[1-9][0-9]*)?", engine_version)
     if engine and int(engine.group(1)) >= 18 and version_tuple(document["minimumVersion"]) < (2, 1, 0):
         raise Refusal("this engine requires installer.minimumVersion >= 2.1.0")
     check_url(document["downloadURL"], "installer.downloadURL", installer_bases())
@@ -359,7 +359,7 @@ def build_catalog(
     check_evidence(evidence, payload["sha256"])
     if installer is not None:
         installer = check_installer(installer, engine["version"])
-    elif re.fullmatch(r"v0\.9\.2-omarchy\.(1[89]|[2-9][0-9]|[1-9][0-9]{2,})", engine["version"]):
+    elif re.fullmatch(r"v0\.9\.2-omarchy\.(1[89]|[2-9][0-9]|[1-9][0-9]{2,})(?:-aurora\.[1-9][0-9]*)?", engine["version"]):
         raise Refusal("this engine needs app 2.1.0 or later: pass installer with minimumVersion >= 2.1.0")
 
     def plain(artifact: dict) -> dict:

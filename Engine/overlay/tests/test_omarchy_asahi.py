@@ -378,6 +378,22 @@ class AsahiStage1AdapterTests(unittest.TestCase):
         self.assertTrue(adapter.preflight_complete)
         self.assertEqual(installer.dutil.add_calls, [])
 
+    def test_required_radio_policy_is_checked_before_ipsw_or_disk_changes(self):
+        self._common_payload()
+        metadata = self._target_metadata()
+        metadata["aurora_stage1"] = {
+            "kind": "common-raw-v1", "qualified_machines": {"j700ap": ["14.8.3"]}}
+        metadata["required_neo_peripherals"] = ["radio"]
+        self._write_metadata([metadata])
+        installer = FakeInstaller(FakeDiskUtil([[self.free]]))
+        installer.sysinfo.device_class = "j700ap"
+        adapter = self._adapter(installer)
+        with self.assertRaisesRegex(AsahiAdapterError, "radio preflight failed"):
+            adapter.preflight(self.plan)
+        self.assertEqual(installer.chosen_firmware, "unset")
+        self.assertEqual(installer.dutil.add_calls, [])
+        self.assertFalse(adapter.preflight_complete)
+
     def test_generic_image_requires_explicit_board_and_firmware_qualification(self):
         self._common_payload()
         for contract in (None, {"kind": "common-raw-v1", "qualified_machines": {
@@ -2202,20 +2218,27 @@ class NeoRadioFirmwareTests(unittest.TestCase):
         radio.BT_PTX, "j700-mt7932-btcal.bin", "j700-mt7932-bdaddr.bin"
     )})
 
-    def run_hook(self, device_class, collect, required=True):
+    def run_hook(self, device_class, collect, required=True, policies=None):
         package = SimpleNamespace(added=[])
         package.add_file = lambda name, data: package.added.append((name, data))
-        installer = SimpleNamespace(sysinfo=SimpleNamespace(device_class=device_class))
+        installer = SimpleNamespace(
+            sysinfo=SimpleNamespace(device_class=device_class),
+            neo_regulatory_policies={} if policies is None else policies)
         firmware = SimpleNamespace(core=SimpleNamespace(FWFile=lambda name, data: ("FWFile", name, data)))
         with patch("omarchy_asahi.asahi_firmware", firmware):
             _collect_neo_radios(installer, package, collect=collect, required=required)
         return package.added
 
     def test_a_neo_adds_every_collected_file(self):
-        added = self.run_hook("j700ap", lambda: self.files)
+        policies = {"mediatek/mt7932/policy/world-XZ.bin": b"admitted policy"}
+        added = self.run_hook("j700ap", lambda: self.files, policies=policies)
         self.assertEqual(added, [
-            (name, ("FWFile", name, data)) for name, data in sorted(self.files.items())
+            (name, ("FWFile", name, data)) for name, data in sorted((self.files | policies).items())
         ])
+
+    def test_required_radio_refuses_to_publish_without_admitted_policy(self):
+        with self.assertRaisesRegex(AsahiAdapterError, "not admitted during preflight"):
+            self.run_hook("j700ap", lambda: self.files)
 
     def test_other_macs_collect_nothing(self):
         def collect():

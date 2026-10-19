@@ -783,6 +783,10 @@ def _collect_neo_radios(installer, pkg, collect=None, *, required=False):
             raise AsahiAdapterError(f"MacBook Neo radio firmware collection failed: {error}") from error
         logging.warning("MacBook Neo radio firmware unavailable; Wi-Fi and Bluetooth may be unavailable: %s", error)
         return
+    files = dict(files)
+    files.update(getattr(installer, "neo_regulatory_policies", {}))
+    if required and not files.get("mediatek/mt7932/policy/world-XZ.bin"):
+        raise AsahiAdapterError("MacBook Neo radio policy was not admitted during preflight")
     for name, data in sorted(files.items()):
         pkg.add_file(name, asahi_firmware.core.FWFile(name, data))
     logging.info("MacBook Neo radio firmware: %d files", len(files))
@@ -1242,6 +1246,16 @@ class AsahiStage1Adapter:
         except (OSError, zipfile.BadZipFile) as error:
             raise AsahiAdapterError("invalid Omarchy payload") from error
         self._validate_full_os_package()
+        neo_policies = {}
+        required = self.template.get("required_neo_peripherals", [])
+        if not isinstance(required, list) or any(item not in ("radio", "touch-id") for item in required):
+            raise AsahiAdapterError("unknown required Neo peripheral contract")
+        if board == "j700ap" and "radio" in required:
+            try:
+                neo_policies = omarchy_mt7932.collect_policy_inputs(
+                    self.osins.pkg, self.template.get("neo_regulatory_policy"))
+            except omarchy_mt7932.Mt7932Error as error:
+                raise AsahiAdapterError(f"MacBook Neo radio preflight failed: {error}") from error
         ipsw = self.installer.choose_ipsw(
             self.template.get("supported_fw"),
         )
@@ -1251,9 +1265,8 @@ class AsahiStage1Adapter:
             self.installer.osinfo,
         )
         required = self.template.get("required_neo_peripherals", [])
-        if not isinstance(required, list) or any(item not in ("radio", "touch-id") for item in required):
-            raise AsahiAdapterError("unknown required Neo peripheral contract")
         self.installer.ins.required_neo_peripherals = required
+        self.installer.ins.neo_regulatory_policies = neo_policies
         self.installer.ins.load_ipsw(ipsw)
         self.os_firmware = ipsw.version.split(maxsplit=1)[0]
         esp_members = self._esp_members()

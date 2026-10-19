@@ -40,7 +40,7 @@ class AuroraPackageRolesTests(unittest.TestCase):
         policy = json.loads((ROOT / "image-builder/builder/candidate-trust/policy.json").read_text())
         self.assertEqual(set(policy["hardware_profiles"]["neo"]["support_packages"]), {
             "aurora-audio", "alsa-ucm-conf-aurora", "speakerguardd", "omarchy-aurora-firmware",
-            "mesa-aurora", "vulkan-aurora", "aurora-bless",
+            "mesa-aurora", "vulkan-aurora", "aurora-bless", "avd-fw", "upower-aurora",
         })
         self.assertEqual(policy["support_packages"], [])
         self.assertIn("m1n1-aurora", policy["boot_packages"])

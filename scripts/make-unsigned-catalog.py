@@ -315,7 +315,7 @@ def load_inputs(path: Path, developer: bool = False) -> dict:
         )
     # Engines with recommendation fields require the compatible decoder and
     # reserve-policy UI. Refuse a catalog that sends older apps into decoding.
-    engine = re.fullmatch(r"v0\.9\.2-omarchy\.(\d+)", document["engine_version"])
+    engine = re.fullmatch(r"v0\.9\.2-omarchy\.(\d+)(?:-aurora\.[1-9][0-9]*)?", document["engine_version"])
     if engine and int(engine.group(1)) >= 18 and parse_version(installer["minimum_version"]) < (2, 1, 0):
         raise SystemExit("this engine requires installer.minimum_version >= 2.1.0")
     download_url = installer["download_url"]
