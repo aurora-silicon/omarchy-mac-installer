@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 import zlib
 
@@ -55,6 +56,18 @@ class InspectionTest(unittest.TestCase):
         SUBVOLUMES.clear()
         SUBVOLUMES.add(self.root / ".snapshots")
 
+    def test_aurora_upower_rejects_stock_provider(self):
+        candidates = SimpleNamespace(packages={"upower-aurora": {"version": "1.91.4.aurora1-1"}})
+        local = self.root / "var/lib/pacman/local"
+        entry = local / "upower-aurora-1.91.4.aurora1-1"
+        entry.mkdir()
+        (entry / "desc").write_text("%NAME%\nupower-aurora\n\n%VERSION%\n1.91.4.aurora1-1\n")
+        inspection.check_candidate_versions(self.root, candidates, {})
+        stock = local / "upower-1.91.5-1"
+        stock.mkdir()
+        (stock / "desc").write_text("%NAME%\nupower\n\n%VERSION%\n1.91.5-1\n")
+        with self.assertRaisesRegex(inspection.InspectionError, "stock upower is installed"):
+            inspection.check_candidate_versions(self.root, candidates, {})
     def inspect(self, candidates=None):
         return inspection.inspect(self.root, candidates or self.candidates, "edge", self.factory,
                                   trust=self.signer.trust)

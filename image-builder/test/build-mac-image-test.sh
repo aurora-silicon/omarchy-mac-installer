@@ -897,29 +897,29 @@ pass "Neo stages matched board payloads and rejects missing Aura Stage 1; legacy
 (
   candidates=$scratch/neo-runtime-inputs
   mkdir -p "$candidates"
-  printf '%s\n' '{"packages":[{"name":"mesa-aurora"},{"name":"vulkan-aurora"},{"name":"aurora-bless"}]}' >"$candidates/import.json"
-  [[ $(qualified mesa vulkan-asahi asahi-bless | paste -sd' ' -) == "omarchy-candidates/mesa-aurora omarchy-candidates/vulkan-aurora omarchy-candidates/aurora-bless" ]] || exit 1
-  runtime_lists() { printf '%s\n' mesa; }
-  target_pacman() { [[ $* == "-Sp --print-format x omarchy-candidates/mesa-aurora" ]]; }
+  printf '%s\n' '{"packages":[{"name":"mesa-aurora"},{"name":"vulkan-aurora"},{"name":"aurora-bless"},{"name":"upower-aurora"}]}' >"$candidates/import.json"
+  [[ $(qualified mesa vulkan-asahi asahi-bless upower | paste -sd' ' -) == "omarchy-candidates/mesa-aurora omarchy-candidates/vulkan-aurora omarchy-candidates/aurora-bless omarchy-candidates/upower-aurora" ]] || exit 1
+  runtime_lists() { printf '%s\n' mesa upower; }
+  target_pacman() { [[ $* == "-Sp --print-format x omarchy-candidates/mesa-aurora" || $* == "-Sp --print-format x omarchy-candidates/upower-aurora" ]]; }
   available_base
-  [[ ${base_names[*]} == "omarchy-candidates/mesa-aurora" ]]
-) || fail "Neo base package request bypasses the reviewed Mesa archive"
-pass "Neo base and Apple runtime requests use the reviewed Mesa, Vulkan and bless packages"
+  [[ ${base_names[*]} == "omarchy-candidates/mesa-aurora omarchy-candidates/upower-aurora" ]]
+) || fail "Neo base package request bypasses the reviewed Mesa or UPower archive"
+pass "Neo base and Apple runtime requests use the reviewed Mesa, Vulkan, bless and UPower packages"
 
 # Neo's runtime transaction carries the reviewed Mesa, so stock mesa never installs
 # and the Apple set needs no conflict prompt. Legacy's runtime is unchanged.
 (
   candidates=$scratch/neo-runtime-mesa
   mkdir -p "$candidates"
-  printf '%s\n' '{"hardware_profile":"neo","packages":[{"name":"omarchy-dev","role":"omarchy"},{"name":"mesa-aurora"},{"name":"vulkan-aurora"}]}' >"$candidates/import.json"
+  printf '%s\n' '{"hardware_profile":"neo","packages":[{"name":"omarchy-dev","role":"omarchy"},{"name":"mesa-aurora"},{"name":"vulkan-aurora"},{"name":"upower-aurora"}]}' >"$candidates/import.json"
   mount_api() { :; }
   unmount_api() { :; }
   target_pacman() { printf '%s\n' "$*" >"$scratch/neo-runtime-transaction"; }
   base_names=(hyprland)
   install_runtime
-  [[ $(<"$scratch/neo-runtime-transaction") == "-S omarchy-candidates/omarchy-dev hyprland omarchy-candidates/mesa-aurora omarchy-candidates/vulkan-aurora" ]] || exit 1
-  printf '%s\n' '{"packages":[{"name":"omarchy-dev","role":"omarchy"},{"name":"mesa-aurora"},{"name":"vulkan-aurora"}]}' >"$candidates/import.json"
+  [[ $(<"$scratch/neo-runtime-transaction") == "-S omarchy-candidates/omarchy-dev hyprland omarchy-candidates/mesa-aurora omarchy-candidates/vulkan-aurora omarchy-candidates/upower-aurora" ]] || exit 1
+  printf '%s\n' '{"packages":[{"name":"omarchy-dev","role":"omarchy"},{"name":"mesa-aurora"},{"name":"vulkan-aurora"},{"name":"upower-aurora"}]}' >"$candidates/import.json"
   install_runtime
   [[ $(<"$scratch/neo-runtime-transaction") == "-S omarchy-candidates/omarchy-dev hyprland" ]]
-) || fail "the Neo runtime transaction does not carry the reviewed Mesa, or legacy's does"
-pass "Neo installs the reviewed Mesa and Vulkan with the runtime; legacy's runtime is unchanged"
+) || fail "the Neo runtime transaction does not carry the reviewed Mesa and UPower, or legacy's does"
+pass "Neo installs the reviewed Mesa, Vulkan and UPower with the runtime; legacy's runtime is unchanged"

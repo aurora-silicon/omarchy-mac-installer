@@ -159,6 +159,8 @@ def check_candidate_versions(root: Path, candidates: Candidates, report: dict) -
     for name, package in candidates.packages.items():
         require(versions.get(name) == package["version"],
                 f"{name} is {versions.get(name) or 'not installed'}, the set has {package['version']}")
+    if "upower-aurora" in candidates.packages:
+        require("upower" not in versions, "stock upower is installed beside upower-aurora")
     return f"all {len(candidates.packages)} candidate packages installed at the set's versions"
 
 
