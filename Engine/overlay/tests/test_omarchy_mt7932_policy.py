@@ -169,7 +169,7 @@ def synthetic_tables():
 def synthetic_pins():
     """The pins the synthetic tables would need, for tests through collect()."""
     return {path: hashlib.sha256(blob).hexdigest()
-            for path, blob in policy.derive(synthetic_tables(), pins=None).items()}
+            for path, blob in policy.derive(synthetic_tables(), pins=None, input_pins=None).items()}
 
 
 def write_tables(directory, tables=None):
@@ -270,7 +270,7 @@ class DeriveTests(unittest.TestCase):
     """derive() turns the five tables into parser-gated world-XZ and US files."""
 
     def test_synthetic_tables_derive_both_policies(self):
-        files = policy.derive(synthetic_tables(), pins=None)
+        files = policy.derive(synthetic_tables(), pins=None, input_pins=None)
         self.assertEqual(sorted(files), [
             "mediatek/mt7932/policy/US.bin", "mediatek/mt7932/policy/world-XZ.bin",
         ])
@@ -297,32 +297,57 @@ class DeriveTests(unittest.TestCase):
     def test_the_pinned_hashes_gate_the_result(self):
         tables = synthetic_tables()
         with self.assertRaisesRegex(policy.PolicyError, "world-XZ.bin is not the pinned policy"):
-            policy.derive(tables)
+            policy.derive(tables, input_pins=None)
         pins = synthetic_pins()
-        self.assertEqual(policy.derive(tables, pins=pins), policy.derive(tables, pins=None))
+        self.assertEqual(policy.derive(tables, pins=pins, input_pins=None), policy.derive(tables, pins=None, input_pins=None))
         wrong = dict(pins)
         wrong["mediatek/mt7932/policy/US.bin"] = "0" * 64
         with self.assertRaisesRegex(policy.PolicyError, "US.bin is not the pinned policy"):
-            policy.derive(tables, pins=wrong)
+            policy.derive(tables, pins=wrong, input_pins=None)
 
     def test_version_lines_and_joins_are_checked(self):
         tables = synthetic_tables()
         tables[tool.POWER_NAME] = power_text(version="{Ver:later}").encode()
         with self.assertRaises(policy.SchemaError) as caught:
-            policy.derive(tables, pins=None)
+            policy.derive(tables, pins=None, input_pins=None)
         self.assertEqual(caught.exception.code, "version")
         tables = synthetic_tables()
         tables[tool.SAR_NAME] = sar_text(sections=("XZ",)).encode()
         with self.assertRaisesRegex(policy.PolicyError, "join US missing sar"):
-            policy.derive(tables, pins=None)
+            policy.derive(tables, pins=None, input_pins=None)
         tables = synthetic_tables()
         del tables[tool.SDB_NAME]
         with self.assertRaisesRegex(policy.SchemaError, "missing"):
-            policy.derive(tables, pins=None)
+            policy.derive(tables, pins=None, input_pins=None)
         tables = synthetic_tables()
         tables[tool.SDB_NAME] = "é".encode() + tables[tool.SDB_NAME]
         with self.assertRaises(policy.SchemaError):
-            policy.derive(tables, pins=None)
+            policy.derive(tables, pins=None, input_pins=None)
+
+    def test_all_complete_countries_are_derived(self):
+        sections = ("XZ", "US", "CA", "GB", "DE", "JP")
+        tables = synthetic_tables()
+        tables[tool.POWER_NAME] = power_text(sections=sections + ("MH", "X2", "KP")).encode()
+        tables[tool.SAR_NAME] = sar_text(sections=sections).encode()
+        tables[tool.COMMON_NAME] = common_text(sections=sections).encode()
+        tables[tool.DB_NAME] = db_text(labels=sections).encode()
+        files = policy.derive(tables, pins=None, input_pins=None)
+        self.assertEqual(set(files), {
+            "mediatek/mt7932/policy/" + ("world-XZ" if country == "XZ" else country) + ".bin"
+            for country in sections
+        })
+        for country in sections:
+            name = "world-XZ" if country == "XZ" else country
+            self.assertEqual(policy.policy_parse(files[f"mediatek/mt7932/policy/{name}.bin"], country.encode()), 0)
+        self.assertEqual(files, policy.derive(dict(reversed(list(tables.items()))), pins=None, input_pins=None))
+
+    def test_input_hashes_cover_country_specific_changes(self):
+        tables = synthetic_tables()
+        pins = {name: hashlib.sha256(data).hexdigest() for name, data in tables.items()}
+        policy.derive(tables, pins=None, input_pins=pins)
+        tables[tool.SAR_NAME] = tables[tool.SAR_NAME].replace(b"subband1,1", b"subband1,2")
+        with self.assertRaisesRegex(policy.SchemaError, "not the pinned input"):
+            policy.derive(tables, pins=None, input_pins=pins)
 
     def test_join_status(self):
         power = sar = common = {"US": {}, "XZ": {}}
@@ -348,10 +373,17 @@ class PinnedTablesTests(unittest.TestCase):
 
     def test_the_25g83_tables_derive_the_pinned_policy(self):
         files = policy.derive(policy.read_tables(os.environ["OMARCHY_NEO_IZUBA"]))
-        self.assertEqual(
-            {path: hashlib.sha256(blob).hexdigest() for path, blob in files.items()},
-            policy.PINNED_OUTPUT,
-        )
+        self.assertEqual(len(files), 244)
+        index = "\n".join(sorted(files)) + "\n"
+        self.assertEqual(hashlib.sha256(index.encode()).hexdigest(),
+                         "32b3392b3b5afeb7bd7002771d6ed0b863ea269618ae67717a8f5a8d43ddb1d0")
+        hashes = {path: hashlib.sha256(blob).hexdigest() for path, blob in files.items()}
+        self.assertTrue(policy.PINNED_OUTPUT.keys() <= hashes.keys())
+        for path, expected in policy.PINNED_OUTPUT.items():
+            self.assertEqual(hashes[path], expected)
+        for path, blob in files.items():
+            country = "XZ" if path.endswith("world-XZ.bin") else Path(path).stem
+            self.assertEqual(policy.policy_parse(blob, country.encode("ascii")), 0)
 
 
 class TextGrammarTests(unittest.TestCase):
