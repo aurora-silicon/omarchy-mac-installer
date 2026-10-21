@@ -360,6 +360,14 @@ final class InstallerView: NSViewController, NSTextFieldDelegate {
       center.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
       center.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
     ])
+    if model.stage == .welcome {
+      let credit = madeWithLove()
+      footer.addSubview(credit)
+      NSLayoutConstraint.activate([
+        credit.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
+        credit.topAnchor.constraint(equalTo: footer.topAnchor),
+      ])
+    }
     let details = RecoveryTextButton(
       title: "Show details", target: self, action: #selector(detailsPressed))
     footer.addSubview(details)
@@ -368,6 +376,30 @@ final class InstallerView: NSViewController, NSTextFieldDelegate {
       details.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
     ])
     detailsButton = details
+  }
+
+  private func madeWithLove() -> NSStackView {
+    let row = NSStackView()
+    row.orientation = .horizontal
+    row.spacing = 5
+    row.translatesAutoresizingMaskIntoConstraints = false
+    row.addArrangedSubview(label("Made with", size: 11))
+    if let symbol = NSImage(systemSymbolName: "heart.fill", accessibilityDescription: nil) {
+      let heart = NSImageView(image: symbol)
+      heart.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+      heart.contentTintColor = OmarchyTheme.danger
+      row.addArrangedSubview(heart)
+    } else {
+      let heart = label("♥", size: 11)
+      heart.textColor = OmarchyTheme.danger
+      row.addArrangedSubview(heart)
+    }
+    row.addArrangedSubview(label("By Omarchy Team M & The Community", size: 11))
+    for child in row.arrangedSubviews { child.setAccessibilityElement(false) }
+    row.setAccessibilityElement(true)
+    row.setAccessibilityRole(.staticText)
+    row.setAccessibilityLabel("Made with love by Omarchy Team M & The Community")
+    return row
   }
 
   private func fieldRow(_ title: String, field: NSTextField) -> NSStackView {
