@@ -22,6 +22,7 @@ final class InstallerView: NSViewController, NSTextFieldDelegate {
   private var accountButton: NSButton?
   private var skipButton: NSButton?
   private var detailsButton: NSButton?
+  private var creditRow: NSView?
   private var issueShowing = false
   private var issueRepair = false
   private var authorizationRepair = false
@@ -176,6 +177,8 @@ final class InstallerView: NSViewController, NSTextFieldDelegate {
   private func buildStage() {
     for child in content.subviews { child.removeFromSuperview() }
     for child in footer.subviews { child.removeFromSuperview() }
+    creditRow?.removeFromSuperview()
+    creditRow = nil
     primaryButton = nil
     debugButton = nil
     proxyButton = nil
@@ -361,12 +364,14 @@ final class InstallerView: NSViewController, NSTextFieldDelegate {
       center.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
     ])
     if model.stage == .welcome {
+      // The credit sits above the footer, so the root view owns it.
       let credit = madeWithLove()
-      footer.addSubview(credit)
+      view.addSubview(credit)
       NSLayoutConstraint.activate([
-        credit.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
-        credit.topAnchor.constraint(equalTo: footer.topAnchor),
+        credit.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+        credit.bottomAnchor.constraint(equalTo: center.topAnchor, constant: -20),
       ])
+      creditRow = credit
     }
     let details = RecoveryTextButton(
       title: "Show details", target: self, action: #selector(detailsPressed))
@@ -395,7 +400,7 @@ final class InstallerView: NSViewController, NSTextFieldDelegate {
       row.addArrangedSubview(heart)
     }
     row.addArrangedSubview(label("By Omarchy Team M & The Community", size: 11))
-    for child in row.arrangedSubviews { child.setAccessibilityElement(false) }
+    row.setAccessibilityChildren([])
     row.setAccessibilityElement(true)
     row.setAccessibilityRole(.staticText)
     row.setAccessibilityLabel("Made with love by Omarchy Team M & The Community")
@@ -474,6 +479,7 @@ final class InstallerView: NSViewController, NSTextFieldDelegate {
 
   @objc private func startPressed() {
     LaunchTrace.mark("ui.continue.pressed")
+    creditRow?.isHidden = true
     if model.recoveryInterface {
       model.restore()
     } else {
